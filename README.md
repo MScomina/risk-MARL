@@ -1,4 +1,4 @@
-# Project: ArXiv Visualizer
+# Project
 Project for the course "Reinforcement Learning" - UniTS.
 
 ## Description
