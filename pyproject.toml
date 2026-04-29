@@ -5,8 +5,8 @@ readme = "README.md"
 requires-python = "3.10.19"
 
 dependencies = [
-    "pettingzoo>=1.25.0",
-    "numpy>=2.2.6",
+    "pettingzoo~=1.26.0",
+    "numpy~=2.2.6",
 ]
 
 [build-system]
