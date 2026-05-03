@@ -63,17 +63,10 @@ class raw_env(AECEnv):
         )
         self._action_spaces = Dict(
             {
-                agent: Dict(
-                    {
-                        "reinforce_move" : MultiDiscrete(self.map_network.number_of_nodes(), max_armies+1),     # Reinforce move (place troops).
-                        "atk_move" : Dict(
-                            {
-                                "edge" : Discrete(self.map_network.number_of_edges()),  # Directed edge of graph where the movement/attack happens.
-                                "amount" : Discrete(self.max_armies),                   # How many armies are used.
-                                "is_move" : Discrete(2)                                 # Whether it's a movement or an attack.
-                            }
-                        )
-                    }
+                agent: risk_utils.generic_action_space(
+                    self.map_network,
+                    self.num_agents,
+                    self.max_armies
                 ) for agent in self.possible_agents
             }
         )

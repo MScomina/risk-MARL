@@ -44,7 +44,7 @@ def generate_graph(map_path: str | Path = None) -> nx.Graph:
         G.graph["edge_to_idx"][(u, v)] = i
         G.graph["idx_to_edge"][i] = (u, v)
 
-    for i, (u, v) in enumerate(edge_list):
+    for i, (u, v) in enumerate(list(G.edges())):
         G[u][v]["id"] = i
 
     return G
