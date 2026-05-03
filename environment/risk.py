@@ -19,6 +19,7 @@ from pettingzoo.utils import AgentSelector, wrappers
 from pathlib import Path
 
 from maps import graph_utils
+import risk_utils
 
 # Environment definitions:
 #   (Underlying) Space states:  
@@ -31,45 +32,45 @@ from maps import graph_utils
 #       If still starting placing: place until every territory is filled by somebody.
 #       Otherwise:
 #       - If phase 0: place any amount of troops on nodes of graph until no more can be placed
-#       - If phase 1: pick any two (connected) nodes (owned by the player) and number of armies:
-#           - If only one owned: Attack (max 3)
-#           - If both are owned: Move, then end turn
+#       - If phase 1: pick any edge and number of armies and action to perform.
 
+
+# Default values
+NUM_AGENTS = 2
+MAX_ARMIES = 100
 MAX_ITERS = 10_000
+
 
 class raw_env(AECEnv):
 
     metadata : dict = {"render_modes": ["human"], "name": "risk-v1"}
 
-    def __init__(self, render_mode=None, n_agents : int = 2, map_path : Path | None = None, max_armies : int = 100):
+    def __init__(self, render_mode=None, num_agents : int = NUM_AGENTS, map_path : Path | None = None, max_armies : int = MAX_ARMIES, max_iters : int = MAX_ITERS):
 
-        self.possible_agents = ["player_" + str(r) for r in range(n_agents)]
-        self.map_network = graph_utils.generate_graph(map_path).to_directed()
+        self.possible_agents = ["player_" + str(r) for r in range(num_agents)]
+        self.num_agents = num_agents
+        self.map_network = graph_utils.generate_graph(map_path)
         self.max_armies = max_armies
+        self.max_iters = max_iters
         self._observation_spaces = Dict(
             {
-                agent: Dict(
-                    {
-                        "owned": MultiBinary(self.map_network.number_of_nodes()),
-                        "territory_owner": MultiDiscrete([n_agents+1] * self.map_network.number_of_nodes()),
-                        "number_of_armies": MultiDiscrete([max_armies+1] * self.map_network.number_of_nodes()),
-                        "is_starting_placement" : Discrete(2),
-                        "troops_to_place" : Discrete(self.max_armies)
-                    } for agent in self.possible_agents
-                )
+                agent: risk_utils.generic_observation_space(
+                    self.map_network,
+                    self.num_agents,
+                    self.max_armies
+                ) for agent in self.possible_agents
             }
         )
         self._action_spaces = Dict(
             {
                 agent: Dict(
                     {
-                        "reinforce_move" : MultiDiscrete(self.map_network.number_of_nodes(), max_armies+1),
+                        "reinforce_move" : MultiDiscrete(self.map_network.number_of_nodes(), max_armies+1),     # Reinforce move (place troops).
                         "atk_move" : Dict(
                             {
-                                "src" : Discrete(self.map_network.number_of_nodes()),
-                                "dst" : Discrete(self.map_network.number_of_nodes()),
-                                "amount" : Discrete(self.max_armies),
-                                "is_move" : Discrete(2)
+                                "edge" : Discrete(self.map_network.number_of_edges()),  # Directed edge of graph where the movement/attack happens.
+                                "amount" : Discrete(self.max_armies),                   # How many armies are used.
+                                "is_move" : Discrete(2)                                 # Whether it's a movement or an attack.
                             }
                         )
                     }
@@ -105,22 +106,18 @@ class raw_env(AECEnv):
         self.infos = {agent: {} for agent in self.agents}
 
         self.state = {
-            agent : {
-                "owned" : np.full(shape=self.map_network.number_of_nodes(), fill_value=False),
-                "territory_owner" : np.full(shape=self.map_network.number_of_nodes(), fill_value=self.num_agents),
-                "number_of_armies" : np.zeros(self.map_network.number_of_nodes()),
-                "is_starting_placement" : 1,
-                "troops_to_place" : 0
-            } for agent in self.agents
+            agent : risk_utils.generate_starting_observation(
+                game_map=self.map_network, 
+                num_agents=self.num_agents, 
+                full_knowledge=True
+                ) for agent in self.agents
         }
+
         self.observations = {
-            agent : {
-                "owned" : np.full(shape=self.map_network.number_of_nodes(), fill_value=False),
-                "territory_owner" : np.full(shape=self.map_network.number_of_nodes(), fill_value=self.num_agents),
-                "number_of_armies" : np.zeros(self.map_network.number_of_nodes()),
-                "is_starting_placement" : 1,
-                "troops_to_place" : 0
-            } for agent in self.agents
+            agent : risk_utils.generate_starting_observation(
+                game_map=self.map_network, 
+                num_agents=self.num_agents
+                ) for agent in self.agents
         }
 
         self.num_moves = 0
@@ -154,5 +151,5 @@ class raw_env(AECEnv):
 
             self.num_moves += 1
             self.truncations = {
-                agent: self.num_moves >= MAX_ITERS for agent in self.agents
+                agent: self.num_moves >= self.max_iters for agent in self.agents
             }

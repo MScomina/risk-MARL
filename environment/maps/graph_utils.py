@@ -1,3 +1,6 @@
+# https://networkx.org/documentation/stable/reference/classes/generated/networkx.DiGraph.successors.html
+# https://networkx.org/documentation/stable/reference/classes/generated/networkx.DiGraph.out_edges.html
+
 import json
 from pathlib import Path
 import networkx as nx
@@ -33,5 +36,15 @@ def generate_graph(map_path: str | Path = None) -> nx.Graph:
         cont["name"]: {"bonus": cont["bonus"], "territories": cont["territories"]}
         for cont in continents
     }
+
+    G = G.to_directed()
+    G.graph["edge_to_idx"] = {}
+    G.graph["idx_to_edge"] = {}
+    for i, (u, v) in enumerate(list(G.edges())):
+        G.graph["edge_to_idx"][(u, v)] = i
+        G.graph["idx_to_edge"][i] = (u, v)
+
+    for i, (u, v) in enumerate(edge_list):
+        G[u][v]["id"] = i
 
     return G
