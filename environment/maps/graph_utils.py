@@ -22,15 +22,21 @@ def generate_graph(map_path: str | Path = None) -> nx.Graph:
 
     G = nx.Graph()
 
-    for tid, attrs in territories.items():
-        G.add_node(
-            tid,
-            continent=terr_to_cont[tid],
-        )
+    G.graph["node_to_idx"] = {}
+    G.graph["idx_to_node"] = {}
 
-    for tid, attrs in territories.items():
+    for idx, (territory_name, attrs) in enumerate(territories.items()):
+        G.add_node(
+            territory_name,
+            id=idx,
+            continent=terr_to_cont[territory_name]
+        )
+        G.graph["node_to_idx"][territory_name] = idx
+        G.graph["idx_to_node"][idx] = territory_name
+
+    for territory_name, attrs in territories.items():
         for nbr_name in attrs["adjacency"]:
-            G.add_edge(tid, nbr_name)
+            G.add_edge(territory_name, nbr_name)
 
     G.graph["continents"] = {
         cont["name"]: {"bonus": cont["bonus"], "territories": cont["territories"]}
@@ -46,5 +52,12 @@ def generate_graph(map_path: str | Path = None) -> nx.Graph:
 
     for i, (u, v) in enumerate(list(G.edges())):
         G[u][v]["id"] = i
+
+    def edge_to_nodes_id(self, idx):
+        edge = self.graph["idx_to_edge"]
+        src, dst = edge
+        return self.graph["node_to_idx"][src], self.graph["node_to_idx"][dst]
+
+    G.edge_to_nodes_id = edge_to_nodes_id
 
     return G

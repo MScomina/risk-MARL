@@ -98,19 +98,25 @@ class raw_env(AECEnv):
         self.truncations = {agent: False for agent in self.agents}
         self.infos = {agent: {} for agent in self.agents}
 
+        self.world_state = risk_utils.generate_starting_observation(
+            game_map=self.map_network, 
+            num_agents=self.num_agents
+        )
+
         self.state = {
-            agent : risk_utils.generate_starting_observation(
-                game_map=self.map_network, 
-                num_agents=self.num_agents, 
-                full_knowledge=True
-                ) for agent in self.agents
+            agent : self.world_state for agent in self.agents
         }
 
         self.observations = {
-            agent : risk_utils.generate_starting_observation(
-                game_map=self.map_network, 
-                num_agents=self.num_agents
-                ) for agent in self.agents
+            agent : {
+                "observation": self.world_state,
+                "action_mask": risk_utils.generate_action_mask(
+                    game_map=self.map_network,
+                    max_armies=self.max_armies,
+                    agent_state=self.world_state,
+                    agent_id=idx
+                )
+            } for idx, agent in enumerate(self.agents)
         }
 
         self.num_moves = 0
@@ -129,20 +135,83 @@ class raw_env(AECEnv):
 
     def step(self, action):
         
-        if (
-            self.terminations[self.agent_selection]
-            or self.truncations[self.agent_selection]
-        ):
+        if self.terminations[self.agent_selection] or self.truncations[self.agent_selection]:
             self._was_dead_step(action)
             return
 
-        agent = self.agent_selection
+        current_agent = self.agent_selection
+        current_index = self.agents.index(current_agent)
 
         self._cumulative_rewards[agent] = 0
+
+        self._update_state(agent, action)
         if self._agent_selector.is_last():
             # TODO: Rewarding.
+
+
 
             self.num_moves += 1
             self.truncations = {
                 agent: self.num_moves >= self.max_iters for agent in self.agents
             }
+
+
+    def _update_state(self, agent : str, action : dict) -> bool:
+        # Updates the state and returns whether the turn is over or not.
+        is_reinforce = action["reinforce_move"][1] != 0
+        is_attack = action["atk_move"][2]
+        agent_idx = self.agents.index(agent)
+
+        if is_reinforce:
+            node = action["reinforce_move"][0]
+            atk_amount = action["reinforce_move"][1]
+
+            node_unowned = self.world_state["owned"][node] == 0
+            owned_by_agent = self.world_state["territory_owner"][node] == agent_idx
+
+            if not ((node_unowned and atk_amount == 1) or (owned_by_agent and atk_amount <= self.world_state["troops_to_place"])):
+                raise ValueError(f"Illegal reinforce action performed by agent {agent}: {action}.")
+
+            if node_unowned:
+                # Claiming territory.
+                self.world_state["territory_owner"][node] = agent_idx
+                self.world_state["number_of_armies"][node] = 1
+                self.world_state["owned"][node] = 1
+            else:
+                # Reinforcing already owned territory.
+                self.world_state["number_of_armies"][node] += atk_amount
+                self.world_state["troops_to_place"] -= atk_amount
+
+        else:
+            edge = action["atk_move"][0]
+            atk_amount = action["atk_move"][1]
+            src, dst = self.map_network.edge_to_nodes_id(edge)
+
+            is_owner_src = self.world_state["territory_owner"][src] == agent_idx
+            is_owner_dst = self.world_state["territory_owner"][dst] == agent_idx
+
+            src_amount = self.world_state["number_of_armies"][src]
+
+            if not (is_owner_src and ((is_attack and not is_owner_dst and atk_amount <= 3) or (not is_attack and is_owner_dst and atk_amount < src_amount))):
+                raise ValueError(f"Illegal attack action performed by agent {agent}: {action}.")
+
+            if is_attack:
+                # Attacking opponent's territory.
+                dst_amount = self.world_state["number_of_armies"][dst]
+                atk_losses, def_losses = risk_utils.risk_attack_outcome(atk_amount, dst_amount)
+
+                self.world_state["number_of_armies"][src] -= atk_losses
+                self.world_state["number_of_armies"][dst] -= def_losses
+
+                if self.world_state["number_of_armies"][dst] == 0:
+                    # No troops left, control switches.
+                    self.world_state["territory_owner"][dst] = agent_idx
+                    self.world_state["number_of_armies"][dst] += atk_amount - atk_losses
+                    self.world_state["number_of_armies"][src] -= atk_amount - atk_losses
+            else:
+                # Reinforcing one's territory from another territory.
+                self.world_state["number_of_armies"][src] -= atk_amount
+                self.world_state["number_of_armies"][dst] += atk_amount
+                return True
+
+        return False
