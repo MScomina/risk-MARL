@@ -169,34 +169,46 @@ class raw_env(AECEnv):
         current_agent = self.agent_selection
         current_index = self.agents.index(current_agent)
 
+        current_obs = self.observe(current_agent)
+        legal_mask = current_obs["action_mask"]
+
+        self.rewards = {agent: 0 for agent in self.agents}
+
         should_end_turn = self._update_state(current_agent, action)
 
-        if should_end_turn:
-            self.agent_selection = self._agent_selector.next()
-            if not self.world_state["action_phase"] == RiskPhase.STARTING_PLACEMENT:
-                self.world_state["troops_to_place"] = self._compute_reinforcements(self.agent_selection)
-
         if np.all(self.world_state["territory_owner"] == current_index):
-            reward = 1
             for agent in self.agents:
                 if agent == current_agent:
                     self.rewards[agent] = 1
                 else:
                     self.rewards[agent] = -1
                 self.terminations[agent] = True
-
+        elif should_end_turn:
+            next_agent = self._agent_selector.next()
+            while (self.terminations[next_agent] or self.truncations[next_agent]) and next_agent != current_agent:
+                if all(self.terminations[a] or self.truncations[a] for a in self.agents):
+                    break
+                next_agent = self._agent_selector.next()
+                
+            self.agent_selection = next_agent
+            if not self.world_state["action_phase"] == RiskPhase.STARTING_PLACEMENT:
+                self.world_state["troops_to_place"] = self._compute_reinforcements(self.agent_selection)
+        
+        self.num_moves += 1
+        if self._agent_selector.is_last():
+            for agent in self.agents:
+                self.truncations[agent] = self.num_moves >= self.max_iters
 
         self._accumulate_rewards()
+        self._clear_rewards()
 
-        if self._agent_selector.is_last():
-            self.num_moves += 1
-            self.truncations = {
-                agent: self.num_moves >= self.max_iters for agent in self.agents
-            }
+        return self.observations, self.rewards, self.terminations, self.truncations, self.infos
 
 
     def _update_state(self, agent : str, action : dict) -> bool:
         # Updates the state and returns whether the turn is over or not.
+        #print(self.observations[agent])
+        #print(agent, action)
         match self.world_state["action_phase"]:
 
             case RiskPhase.STARTING_PLACEMENT:
@@ -210,7 +222,12 @@ class raw_env(AECEnv):
                 return True
 
             case RiskPhase.SELECT_NODE:
-                if action >= self.map_network.number_of_nodes():
+                if action == self.map_network.number_of_nodes():
+                    # No-op operation, either because agent is dead or all nodes are filled. Skip to next phase.
+                    self.world_state["troops_to_place"] = 0
+                    self.world_state["action_phase"] = int(RiskPhase.SELECT_EDGE)
+                    return False
+                if action > self.map_network.number_of_nodes():
                     raise RuntimeError(f"Agent {agent} tried to pick a node index greater than the number of nodes: {action}")
                 if self.world_state["territory_owner"][action] != self.agents.index(agent):
                     raise RuntimeError(f"Agent {agent} tried to pick another player's territory for action: {action}")
@@ -219,12 +236,17 @@ class raw_env(AECEnv):
                 return False
             
             case RiskPhase.SELECT_EDGE:
-                if action >= self.map_network.number_of_edges():
+                if action == self.map_network.number_of_edges():
+                    # No-op operation (no actions available, must pass turn)
+                    self.world_state["action_phase"] = int(RiskPhase.SELECT_NODE)
+                    self.world_state["selected_edge"] = -1
+                    return True
+                if action > self.map_network.number_of_edges():
                     raise RuntimeError(f"Agent {agent} tried to pick an edge index greater than the number of edges: {action}")
                 edge = self.map_network.graph["idx_to_edge"][action]
-                src = self.map_network.graph["node_to_idx"][edge[0]]
-                if self.world_state["territory_owner"][src] != self.agents.index(agent):
-                    raise RuntimeError(f"Agent {agent} tried to pick an invalid edge ({src} is owned by {self.world_state['territory_owner'][src]}): {action}")
+                src_node = self.map_network.graph["node_to_idx"][edge[0]]
+                if self.world_state["territory_owner"][src_node] != self.agents.index(agent):
+                    raise RuntimeError(f"Agent {agent} tried to pick an invalid edge ({src_node} is owned by {self.world_state['territory_owner'][src_node]}): {action}")
                 self.world_state["selected_edge"] = action
                 self.world_state["action_phase"] = int(RiskPhase.SELECT_ARMY_COUNT)
                 return False
@@ -247,32 +269,31 @@ class raw_env(AECEnv):
                 elif self.world_state["selected_edge"] != -1:
                     
                     edge = self.map_network.graph["idx_to_edge"][self.world_state["selected_edge"]]
-                    src = self.map_network.graph["node_to_idx"][self.map_network.graph["idx_to_edge"][self.world_state["selected_edge"]][0]]
-                    dst = self.map_network.graph["node_to_idx"][self.map_network.graph["idx_to_edge"][self.world_state["selected_edge"]][1]]
+                    src_node = self.map_network.graph["node_to_idx"][self.map_network.graph["idx_to_edge"][self.world_state["selected_edge"]][0]]
+                    dst_node = self.map_network.graph["node_to_idx"][self.map_network.graph["idx_to_edge"][self.world_state["selected_edge"]][1]]
 
-                    if self.world_state["territory_owner"][src] != self.agents.index(agent):
+                    if self.world_state["territory_owner"][dst_node] != self.agents.index(agent):
                         # Attacking.
-                        if action == 0 or action > min(3,self.world_state["number_of_armies"][src]-1):
+                        if action == 0 or action > min(3,self.world_state["number_of_armies"][src_node]-1):
                             raise RuntimeError(f"Agent {agent} tried to attack with too many troops: {action}")
 
-                        dst_amount = self.world_state["number_of_armies"][dst]
+                        dst_amount = self.world_state["number_of_armies"][dst_node]
                         atk_losses, def_losses = risk_utils.risk_attack_outcome(action, dst_amount)
 
-                        self.world_state["number_of_armies"][src] -= atk_losses
-                        self.world_state["number_of_armies"][dst] -= def_losses
+                        self.world_state["number_of_armies"][src_node] -= atk_losses
+                        self.world_state["number_of_armies"][dst_node] -= def_losses
 
-                        if self.world_state["number_of_armies"][dst] == 0:
+                        if self.world_state["number_of_armies"][dst_node] == 0:
                             # No troops left, control switches.
-                            previous_owner = self.world_state["territory_owner"][dst]
-                            self.world_state["territory_owner"][dst] = self.agents.index(agent)
-                            self.world_state["number_of_armies"][dst] += atk_amount - atk_losses
-                            self.world_state["number_of_armies"][src] -= atk_amount - atk_losses
+                            previous_owner = self.world_state["territory_owner"][dst_node]
+                            self.world_state["territory_owner"][dst_node] = self.agents.index(agent)
+                            self.world_state["number_of_armies"][dst_node] += action - atk_losses
+                            self.world_state["number_of_armies"][src_node] -= action - atk_losses
                             should_terminate = True
                             for owner in self.world_state["territory_owner"]:
                                 if owner == previous_owner:
                                     should_terminate = False
                             self.terminations[self.agents[previous_owner]] = should_terminate
-                            self.rewards[self.agents[previous_owner]] = -1
                         
                         self.world_state["action_phase"] = int(RiskPhase.SELECT_EDGE)
                         self.world_state["selected_edge"] = -1
@@ -280,10 +301,10 @@ class raw_env(AECEnv):
                     
                     else:
                         # Moving.
-                        if action == 0 or action >= self.world_state["number_of_armies"][src]:
+                        if action == 0 or action >= self.world_state["number_of_armies"][src_node]:
                             raise RuntimeError(f"Agent {agent} tried to move with too many troops: {action}")
-                        self.world_state["number_of_armies"][src] -= action
-                        self.world_state["number_of_armies"][dst] += action
+                        self.world_state["number_of_armies"][src_node] -= action
+                        self.world_state["number_of_armies"][dst_node] += action
                         self.world_state["action_phase"] = int(RiskPhase.SELECT_NODE)
                         self.world_state["selected_edge"] = -1
                         return True
