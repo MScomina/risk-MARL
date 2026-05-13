@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import networkx as nx
 
-def generate_graph(map_path: str | Path = None) -> nx.Graph:
+def generate_graph(map_path: str | Path | None = None) -> nx.Graph:
     if map_path is None:
         map_path = Path(__file__).parent / "classic.json"
 
@@ -52,12 +52,5 @@ def generate_graph(map_path: str | Path = None) -> nx.Graph:
 
     for i, (u, v) in enumerate(list(G.edges())):
         G[u][v]["id"] = i
-
-    def edge_to_nodes_id(self, idx):
-        edge = self.graph["idx_to_edge"]
-        src, dst = edge
-        return self.graph["node_to_idx"][src], self.graph["node_to_idx"][dst]
-
-    G.edge_to_nodes_id = edge_to_nodes_id
 
     return G

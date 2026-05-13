@@ -3,7 +3,7 @@
 # https://pettingzoo.farama.org/content/environment_creation/
 # Inspiration for environment (masking): https://github.com/Farama-Foundation/PettingZoo/blob/master/pettingzoo/classic/chess/chess.py
 
-from copy import copy
+from copy import copy, deepcopy
 import functools
 import random
 
@@ -12,27 +12,28 @@ import networkx as nx
 
 import gymnasium
 from gymnasium.utils import seeding
-from gymnasium.spaces import Dict, Discrete, MultiDiscrete, MultiBinary
+from gymnasium.spaces import Dict
+from supersuit import flatten_v0
 from pettingzoo import AECEnv
 from pettingzoo.utils import AgentSelector, wrappers
 
 from pathlib import Path
 
-from maps import graph_utils
-import risk_utils
+from .maps import graph_utils
+from . import risk_utils
+from .risk_utils import RiskPhase
 
 # Environment definitions:
 #   (Underlying) Space states:  
 #       - Ownership of territories (part of observation)
 #       - Amount of armies in each territory (part of observation)
-#       - Whether it's the starting placing step or not (part of observation)
-#       - Phase (whether it's fortifying or attack/move phase) (part of observation)
+#       - Action phase (0: initial placing, 1: select army count, 2: select node, 3: select edge)
 #       - Cards in hand (partial observability of each agent) (TBI)
 #   Actions:
-#       If still starting placing: place until every territory is filled by somebody.
-#       Otherwise:
-#       - If phase 0: place any amount of troops on nodes of graph until no more can be placed
-#       - If phase 1: pick any edge and number of armies and action to perform.
+#       The actions are defined based on the state, they could represent, based on the phase:
+#       - Node ID to pick
+#       - Edge ID to pick
+#       - Number of armies to use
 
 
 # Default values
@@ -41,31 +42,46 @@ MAX_ARMIES = 100
 MAX_ITERS = 10_000
 
 
+def env(**kwargs) -> AECEnv:
+    env = raw_env(**kwargs)
+    env = wrappers.TerminateIllegalWrapper(env, illegal_reward=-1)
+    env = wrappers.AssertOutOfBoundsWrapper(env)
+    env = wrappers.OrderEnforcingWrapper(env)
+    return env
+
+
 class raw_env(AECEnv):
 
     metadata : dict = {"render_modes": ["human"], "name": "risk-v1"}
 
-    def __init__(self, render_mode=None, num_agents : int = NUM_AGENTS, map_path : Path | None = None, max_armies : int = MAX_ARMIES, max_iters : int = MAX_ITERS):
+    def __init__(self, render_mode=None, n_agents : int = NUM_AGENTS, map_path : Path | None = None, max_armies : int = MAX_ARMIES, max_iters : int = MAX_ITERS):
 
-        self.possible_agents = ["player_" + str(r) for r in range(num_agents)]
-        self.num_agents = num_agents
+        self.possible_agents = ["player_" + str(r) for r in range(n_agents)]
+        self.n_agents = n_agents
         self.map_network = graph_utils.generate_graph(map_path)
         self.max_armies = max_armies
         self.max_iters = max_iters
-        self._observation_spaces = Dict(
-            {
-                agent: risk_utils.generic_observation_space(
-                    self.map_network,
-                    self.num_agents,
-                    self.max_armies
-                ) for agent in self.possible_agents
-            }
-        )
+        self._observation_spaces = {
+            agent: Dict(
+                {
+                    "observation" : risk_utils.generic_observation_space(
+                        self.map_network,
+                        self.n_agents,
+                        self.max_armies
+                    ),
+                    "action_mask" : risk_utils.generic_mask_space(
+                        self.map_network,
+                        self.n_agents,
+                        self.max_armies
+                    )
+                }
+            ) for agent in self.possible_agents
+        }
         self._action_spaces = Dict(
             {
                 agent: risk_utils.generic_action_space(
                     self.map_network,
-                    self.num_agents,
+                    self.n_agents,
                     self.max_armies
                 ) for agent in self.possible_agents
             }
@@ -100,7 +116,7 @@ class raw_env(AECEnv):
 
         self.world_state = risk_utils.generate_starting_observation(
             game_map=self.map_network, 
-            num_agents=self.num_agents
+            num_agents=self.n_agents
         )
 
         self.state = {
@@ -122,10 +138,21 @@ class raw_env(AECEnv):
         self.num_moves = 0
 
         self._agent_selector = AgentSelector(self.agents)
-        self.agent_selection = self._agent_selector.next()
+        self.agent_selection = self._agent_selector.reset()
 
 
     def observe(self, agent):
+        self.observations[agent]["observation"] = deepcopy(self.world_state)
+        self.observations[agent]["observation"]["action_phase"] = np.array(self.observations[agent]["observation"]["action_phase"], dtype=np.int8)
+        self.observations[agent]["observation"]["troops_to_place"] = np.array(self.observations[agent]["observation"]["troops_to_place"], dtype=np.int16)
+        self.observations[agent]["observation"]["selected_node"] = np.array(self.observations[agent]["observation"]["selected_node"], dtype=np.int16)
+        self.observations[agent]["observation"]["selected_edge"] = np.array(self.observations[agent]["observation"]["selected_edge"], dtype=np.int16)
+        self.observations[agent]["action_mask"] = risk_utils.generate_action_mask(
+            game_map=self.map_network,
+            max_armies=self.max_armies,
+            agent_state=self.world_state,
+            agent_id=self.agents.index(agent)
+        )
         return self.observations[agent]
 
 
@@ -142,14 +169,26 @@ class raw_env(AECEnv):
         current_agent = self.agent_selection
         current_index = self.agents.index(current_agent)
 
-        self._cumulative_rewards[agent] = 0
+        should_end_turn = self._update_state(current_agent, action)
 
-        self._update_state(agent, action)
+        if should_end_turn:
+            self.agent_selection = self._agent_selector.next()
+            if not self.world_state["action_phase"] == RiskPhase.STARTING_PLACEMENT:
+                self.world_state["troops_to_place"] = self._compute_reinforcements(self.agent_selection)
+
+        if np.all(self.world_state["territory_owner"] == current_index):
+            reward = 1
+            for agent in self.agents:
+                if agent == current_agent:
+                    self.rewards[agent] = 1
+                else:
+                    self.rewards[agent] = -1
+                self.terminations[agent] = True
+
+
+        self._accumulate_rewards()
+
         if self._agent_selector.is_last():
-            # TODO: Rewarding.
-
-
-
             self.num_moves += 1
             self.truncations = {
                 agent: self.num_moves >= self.max_iters for agent in self.agents
@@ -158,60 +197,103 @@ class raw_env(AECEnv):
 
     def _update_state(self, agent : str, action : dict) -> bool:
         # Updates the state and returns whether the turn is over or not.
-        is_reinforce = action["reinforce_move"][1] != 0
-        is_attack = action["atk_move"][2]
-        agent_idx = self.agents.index(agent)
+        match self.world_state["action_phase"]:
 
-        if is_reinforce:
-            node = action["reinforce_move"][0]
-            atk_amount = action["reinforce_move"][1]
-
-            node_unowned = self.world_state["owned"][node] == 0
-            owned_by_agent = self.world_state["territory_owner"][node] == agent_idx
-
-            if not ((node_unowned and atk_amount == 1) or (owned_by_agent and atk_amount <= self.world_state["troops_to_place"])):
-                raise ValueError(f"Illegal reinforce action performed by agent {agent}: {action}.")
-
-            if node_unowned:
-                # Claiming territory.
-                self.world_state["territory_owner"][node] = agent_idx
-                self.world_state["number_of_armies"][node] = 1
-                self.world_state["owned"][node] = 1
-            else:
-                # Reinforcing already owned territory.
-                self.world_state["number_of_armies"][node] += atk_amount
-                self.world_state["troops_to_place"] -= atk_amount
-
-        else:
-            edge = action["atk_move"][0]
-            atk_amount = action["atk_move"][1]
-            src, dst = self.map_network.edge_to_nodes_id(edge)
-
-            is_owner_src = self.world_state["territory_owner"][src] == agent_idx
-            is_owner_dst = self.world_state["territory_owner"][dst] == agent_idx
-
-            src_amount = self.world_state["number_of_armies"][src]
-
-            if not (is_owner_src and ((is_attack and not is_owner_dst and atk_amount <= 3) or (not is_attack and is_owner_dst and atk_amount < src_amount))):
-                raise ValueError(f"Illegal attack action performed by agent {agent}: {action}.")
-
-            if is_attack:
-                # Attacking opponent's territory.
-                dst_amount = self.world_state["number_of_armies"][dst]
-                atk_losses, def_losses = risk_utils.risk_attack_outcome(atk_amount, dst_amount)
-
-                self.world_state["number_of_armies"][src] -= atk_losses
-                self.world_state["number_of_armies"][dst] -= def_losses
-
-                if self.world_state["number_of_armies"][dst] == 0:
-                    # No troops left, control switches.
-                    self.world_state["territory_owner"][dst] = agent_idx
-                    self.world_state["number_of_armies"][dst] += atk_amount - atk_losses
-                    self.world_state["number_of_armies"][src] -= atk_amount - atk_losses
-            else:
-                # Reinforcing one's territory from another territory.
-                self.world_state["number_of_armies"][src] -= atk_amount
-                self.world_state["number_of_armies"][dst] += atk_amount
+            case RiskPhase.STARTING_PLACEMENT:
+                if self.world_state["territory_owner"][action] != -1:
+                    raise RuntimeError(f"Agent {agent} tried to own an already owned territory: {action}")
+                self.world_state["territory_owner"][action] = self.agents.index(agent)
+                self.world_state["number_of_armies"][action] = 1
+                if np.all(self.world_state["territory_owner"] != -1):
+                    # All nodes have been taken, reinforcement has begun.
+                    self.world_state["action_phase"] = int(RiskPhase.SELECT_NODE)
                 return True
 
+            case RiskPhase.SELECT_NODE:
+                if action >= self.map_network.number_of_nodes():
+                    raise RuntimeError(f"Agent {agent} tried to pick a node index greater than the number of nodes: {action}")
+                if self.world_state["territory_owner"][action] != self.agents.index(agent):
+                    raise RuntimeError(f"Agent {agent} tried to pick another player's territory for action: {action}")
+                self.world_state["selected_node"] = action
+                self.world_state["action_phase"] = int(RiskPhase.SELECT_ARMY_COUNT)
+                return False
+            
+            case RiskPhase.SELECT_EDGE:
+                if action >= self.map_network.number_of_edges():
+                    raise RuntimeError(f"Agent {agent} tried to pick an edge index greater than the number of edges: {action}")
+                edge = self.map_network.graph["idx_to_edge"][action]
+                src = self.map_network.graph["node_to_idx"][edge[0]]
+                if self.world_state["territory_owner"][src] != self.agents.index(agent):
+                    raise RuntimeError(f"Agent {agent} tried to pick an invalid edge ({src} is owned by {self.world_state['territory_owner'][src]}): {action}")
+                self.world_state["selected_edge"] = action
+                self.world_state["action_phase"] = int(RiskPhase.SELECT_ARMY_COUNT)
+                return False
+
+            case RiskPhase.SELECT_ARMY_COUNT:
+
+                if self.world_state["selected_node"] != -1:
+                    # Reinforcing own territory
+                    if self.world_state["troops_to_place"] < action:
+                        raise RuntimeError(f"Agent {agent} tried to reinforce with more troops than available: {action}")
+                    self.world_state["number_of_armies"][self.world_state["selected_node"]] += action
+                    self.world_state["troops_to_place"] -= action
+                    if self.world_state["troops_to_place"] > 0:
+                        self.world_state["action_phase"] = int(RiskPhase.SELECT_NODE)
+                    else:
+                        self.world_state["action_phase"] = int(RiskPhase.SELECT_EDGE)
+                    self.world_state["selected_node"] = -1
+                    return False
+
+                elif self.world_state["selected_edge"] != -1:
+                    
+                    edge = self.map_network.graph["idx_to_edge"][self.world_state["selected_edge"]]
+                    src = self.map_network.graph["node_to_idx"][self.map_network.graph["idx_to_edge"][self.world_state["selected_edge"]][0]]
+                    dst = self.map_network.graph["node_to_idx"][self.map_network.graph["idx_to_edge"][self.world_state["selected_edge"]][1]]
+
+                    if self.world_state["territory_owner"][src] != self.agents.index(agent):
+                        # Attacking.
+                        if action == 0 or action > min(3,self.world_state["number_of_armies"][src]-1):
+                            raise RuntimeError(f"Agent {agent} tried to attack with too many troops: {action}")
+
+                        dst_amount = self.world_state["number_of_armies"][dst]
+                        atk_losses, def_losses = risk_utils.risk_attack_outcome(action, dst_amount)
+
+                        self.world_state["number_of_armies"][src] -= atk_losses
+                        self.world_state["number_of_armies"][dst] -= def_losses
+
+                        if self.world_state["number_of_armies"][dst] == 0:
+                            # No troops left, control switches.
+                            previous_owner = self.world_state["territory_owner"][dst]
+                            self.world_state["territory_owner"][dst] = self.agents.index(agent)
+                            self.world_state["number_of_armies"][dst] += atk_amount - atk_losses
+                            self.world_state["number_of_armies"][src] -= atk_amount - atk_losses
+                            should_terminate = True
+                            for owner in self.world_state["territory_owner"]:
+                                if owner == previous_owner:
+                                    should_terminate = False
+                            self.terminations[self.agents[previous_owner]] = should_terminate
+                            self.rewards[self.agents[previous_owner]] = -1
+                        
+                        self.world_state["action_phase"] = int(RiskPhase.SELECT_EDGE)
+                        self.world_state["selected_edge"] = -1
+                        return False
+                    
+                    else:
+                        # Moving.
+                        if action == 0 or action >= self.world_state["number_of_armies"][src]:
+                            raise RuntimeError(f"Agent {agent} tried to move with too many troops: {action}")
+                        self.world_state["number_of_armies"][src] -= action
+                        self.world_state["number_of_armies"][dst] += action
+                        self.world_state["action_phase"] = int(RiskPhase.SELECT_NODE)
+                        self.world_state["selected_edge"] = -1
+                        return True
+                
+            case _:
+                raise ValueError(f"Undefined phase condition: {self.world_state['action_phase']}")
+
         return False
+
+    
+    def _compute_reinforcements(self, agent) -> int:
+        # WIP.
+        return 1

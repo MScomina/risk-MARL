@@ -1,16 +1,7 @@
-from pettingzoo.classic import connect_four_v3
+from environment import risk
+from pettingzoo.test import api_test, performance_benchmark
+from gymnasium.spaces.utils import flatten, unflatten, flatdim
 
-env = connect_four_v3.env(render_mode="human")
-env.reset(seed=42)
-
-for agent in env.agent_iter():
-    observation, reward, termination, truncation, info = env.last()
-
-    if termination or truncation:
-        action = None
-    else:
-        mask = observation["action_mask"]
-        action = env.action_space(agent).sample(mask)
-
-    env.step(action)
-env.close()
+env = risk.env(render_mode="human", n_agents=3, max_armies=300)
+api_test(env, num_cycles=1000, verbose_progress=True)
+performance_benchmark(env)
