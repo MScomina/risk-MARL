@@ -6,9 +6,7 @@ from .maps import graph_utils
 import functools
 from enum import IntEnum
 
-from gymnasium.spaces import Box, Dict, Discrete, MultiDiscrete, MultiBinary
-from gymnasium.spaces.utils import flatten, unflatten, flatdim
-from pettingzoo.utils.wrappers import BaseWrapper
+from gymnasium.spaces import Box, Dict, Discrete
 
 # State/observation spaces info:
 #   territory_owner: The owner of the territory, -1 if owned by nobody.
@@ -31,177 +29,178 @@ class RiskPhase(IntEnum):
     SELECT_EDGE = 3
 
 
-@functools.lru_cache(maxsize=100)
-def generic_observation_space(game_map : nx.DiGraph, num_agents : int, max_armies : int) -> Dict:
-    
-    return Dict(
-        {
-            "territory_owner": Box(low=-1, high=num_agents, shape=(game_map.number_of_nodes(), ), dtype=np.int8),
-            "number_of_armies": Box(low=0, high=max_armies+1, shape=(game_map.number_of_nodes(), ), dtype=np.int16),
-            "action_phase" : Discrete(len(RiskPhase), dtype=np.int8),
-            "troops_to_place" : Discrete(max_armies, dtype=np.int16),
-            "selected_node": Discrete(game_map.number_of_nodes()+1, start=-1, dtype=np.int16),
-            "selected_edge": Discrete(game_map.number_of_edges()+1, start=-1, dtype=np.int16),
+class RiskHelper():
+
+    def __init__(self, game_map : nx.DiGraph, num_agents : int, max_armies : int):
+
+        self.game_map = game_map
+        self.num_agents = num_agents
+        self.max_armies = max_armies
+
+        self.num_nodes = self.game_map.number_of_nodes()
+        self.num_edges = self.game_map.number_of_edges()
+        self.mask_size = max(self.num_nodes + 1, self.num_edges + 1, self.max_armies)
+
+    def observation_space(self) -> Dict:
+        
+        return Dict(
+            {
+                "territory_owner": Box(low=-1, high=self.num_agents, shape=(self.num_nodes, ), dtype=np.int8),
+                "number_of_armies": Box(low=0, high=self.max_armies+1, shape=(self.num_nodes, ), dtype=np.int16),
+                "action_phase" : Discrete(len(RiskPhase), dtype=np.int8),
+                "troops_to_place" : Discrete(self.max_armies, dtype=np.int16),
+                "selected_node": Discrete(self.num_nodes+1, start=-1, dtype=np.int16),
+                "selected_edge": Discrete(self.num_edges+1, start=-1, dtype=np.int16),
+            }
+        )
+
+    def starting_observation(self, full_knowledge : bool = False) -> dict:
+
+        return {
+            "territory_owner" : np.full(shape=self.num_nodes, fill_value=-1, dtype=np.int8),
+            "number_of_armies" : np.zeros(self.num_nodes, dtype=np.int16),
+            "action_phase" : np.array(0, dtype=np.int8),
+            "troops_to_place" : np.array(0, dtype=np.int16),
+            "selected_node": np.array(-1, dtype=np.int16),
+            "selected_edge": np.array(-1, dtype=np.int16)
         }
-    )
 
+    def action_space(self) -> Dict:
 
-@functools.lru_cache(maxsize=100)
-def generate_starting_observation(game_map : nx.DiGraph, num_agents : int, full_knowledge : bool = False) -> dict:
+        return Discrete(self.mask_size, dtype=np.int32)
 
-    return {
-        "territory_owner" : np.full(shape=game_map.number_of_nodes(), fill_value=-1, dtype=np.int8),
-        "number_of_armies" : np.zeros(game_map.number_of_nodes(), dtype=np.int16),
-        "action_phase" : np.array(0, dtype=np.int8),
-        "troops_to_place" : np.array(0, dtype=np.int16),
-        "selected_node": np.array(-1, dtype=np.int16),
-        "selected_edge": np.array(-1, dtype=np.int16)
-    }
+    def mask_space(self) -> Dict:
 
+        return Box(low=0, high=1, shape=(self.mask_size, ), dtype=np.int8)
 
-@functools.lru_cache(maxsize=100)
-def generic_action_space(game_map : nx.DiGraph, num_agents : int, max_armies : int) -> Dict:
+    def generate_action_mask(self, agent_id : int, agent_state : dict) -> np.ndarray:
 
-    return Discrete(max(game_map.number_of_nodes()+1, game_map.number_of_edges()+1, max_armies), dtype=np.int32)
+        match agent_state["action_phase"]:
 
+            case RiskPhase.STARTING_PLACEMENT:
+                mask = self._mask_starting_placement(
+                    state=agent_state
+                )
 
-@functools.lru_cache(maxsize=100)
-def generic_mask_space(game_map : nx.DiGraph, num_agents : int, max_armies : int) -> Dict:
+            case RiskPhase.SELECT_NODE:
+                mask = self._mask_select_node(
+                    state=agent_state,
+                    agent_id=agent_id
+                )
 
-    return Box(low=0, high=1, shape=(max(game_map.number_of_nodes()+1, game_map.number_of_edges()+1, max_armies), ), dtype=np.int8)
+            case RiskPhase.SELECT_EDGE:
+                mask = self._mask_select_edge(
+                    state=agent_state, 
+                    agent_id=agent_id
+                )
 
+            case RiskPhase.SELECT_ARMY_COUNT:
+                mask = self._mask_select_army_count(
+                    state=agent_state,
+                    agent_id=agent_id
+                )
 
-def generate_action_mask(game_map : nx.DiGraph, max_armies : int, agent_state : dict, agent_id : int) -> np.ndarray:
+            case _:
+                raise ValueError(f"Undefined phase: {agent_state['action_phase']}")
 
-    match agent_state["action_phase"]:
+        full_mask = np.zeros([self.mask_size], dtype=np.int8)
+        full_mask[:mask.size] = mask
 
-        case RiskPhase.STARTING_PLACEMENT:
-            mask = _mask_starting_placement(agent_state)
+        return full_mask
 
-        case RiskPhase.SELECT_NODE:
-            mask = _mask_select_node(
-                state=agent_state, 
-                graph=game_map,
-                max_armies=max_armies, 
-                agent_id=agent_id
-            )
-
-        case RiskPhase.SELECT_EDGE:
-            mask = _mask_select_edge(
-                state=agent_state, 
-                graph=game_map,
-                max_armies=max_armies, 
-                agent_id=agent_id
-            )
-
-        case RiskPhase.SELECT_ARMY_COUNT:
-            mask = _mask_select_army_count(
-                state=agent_state,
-                graph=game_map,
-                max_armies=max_armies,
-                agent_id=agent_id
-            )
-
-        case _:
-            raise ValueError(f"Undefined phase: {agent_state['action_phase']}")
-
-    full_mask = np.zeros([max(game_map.number_of_nodes()+1, game_map.number_of_edges()+1, max_armies)], dtype=np.int8)
-    full_mask[:mask.size] = mask
-
-    return full_mask
-
-
-def _mask_starting_placement(state : dict) -> np.ndarray:
-    # Still placing at the start, can place one in ANY UNOWNED territories.
-    return state["territory_owner"] == -1
-
-
-def _mask_select_node(state : dict, graph : nx.DiGraph, max_armies : int, agent_id : int) -> np.ndarray:
-    # Since the only time one can pick a node that is NOT the starting placement phase is to reinforce, one can pick any owned nodes.
-    mask = np.zeros(graph.number_of_nodes()+1, dtype=np.int8)
-    owned = (state["territory_owner"] == agent_id)
-    can_expand = (state["number_of_armies"] < max_armies)
-    valid_nodes = owned & can_expand
     
-    valid_indices = np.where(valid_nodes)[0]
-    mask[valid_indices] = 1
+    def _mask_starting_placement(self, state : dict) -> np.ndarray:
+    # Still placing at the start, can place one in ANY UNOWNED territories.
+        return (state["territory_owner"] == -1).astype(np.int8)
 
-    if len(valid_indices) == 0:
-        # No node possible, either the agent is dead or no more troops can be placed. No-op.
-        mask[-1] = 1
+    def _mask_select_node(self, agent_id : int, state : dict) -> np.ndarray:
+        # Since the only time one can pick a node that is NOT the starting placement phase is to reinforce, one can pick any owned nodes.
+        mask = np.zeros(self.num_nodes+1, dtype=np.int8)
 
-    return mask
+        owned = (state["territory_owner"] == agent_id)
+        can_expand = (state["number_of_armies"] < self.max_armies)
+        valid_nodes = owned & can_expand
+        
+        valid_indices = np.where(valid_nodes)[0]
+        mask[valid_indices] = 1
 
+        if len(valid_indices) == 0:
+            # No node possible, either the agent is dead or no more troops can be placed. No-op.
+            mask[-1] = 1
 
-def _mask_select_edge(state : dict, max_armies : int, graph : nx.DiGraph, agent_id : int) -> np.ndarray:
+        return mask
 
-    mask = np.zeros(graph.number_of_edges()+1, dtype=np.int8)
-    owned_nodes = set(np.where(state["territory_owner"] == agent_id)[0].tolist())
+    def _mask_select_edge(self, state : dict, agent_id : int) -> np.ndarray:
 
-    for node in owned_nodes:
-        if state["number_of_armies"][node] <= 1:
-            # Source node only has one army, can't move or attack.
-            continue
-        for edge in graph.out_edges(graph.graph["idx_to_node"][node]):
-            dst_node = graph.graph["node_to_idx"][edge[1]]
-            if not (dst_node in owned_nodes and state["number_of_armies"][dst_node] >= max_armies):
-                mask[graph.graph["edge_to_idx"][edge]] = 1
+        mask = np.zeros(self.num_edges+1, dtype=np.int8)
+        owned_nodes = set(np.where(state["territory_owner"] == agent_id)[0])
+        has_movement = False
 
-    if not np.any(mask):
-        # No action found, must allow No-op/pass turn action.
-        mask[-1] = 1
+        for src_node in owned_nodes:
+            if state["number_of_armies"][src_node] <= 1:
+                # Source node only has one army, can't move or attack.
+                continue
+            for edge in self.game_map.out_edges(self.game_map.graph["idx_to_node"][src_node]):
+                dst_node = self.game_map.graph["node_to_idx"][edge[1]]
+                if not has_movement and (dst_node in owned_nodes and not state["number_of_armies"][dst_node] >= self.max_armies):
+                    has_movement = True
+                if not (dst_node in owned_nodes and state["number_of_armies"][dst_node] >= self.max_armies):
+                    mask[self.game_map.graph["edge_to_idx"][edge]] = 1
 
-    return mask
+        if not has_movement:
+            # No movement action found, must allow No-op/pass turn action.
+            mask[-1] = 1
 
+        return mask
 
-def _mask_select_army_count(state : dict, max_armies : int, graph : nx.DiGraph, agent_id : int) -> np.ndarray:
+    def _mask_select_army_count(self, state : dict, agent_id : int) -> np.ndarray:
 
-    mask = np.zeros(max_armies, dtype=np.int8)
-    owned_nodes = set(np.where(state["territory_owner"] == agent_id)[0].tolist())
+        mask = np.zeros(self.max_armies, dtype=np.int8)
+        owned_nodes = set(np.where(state["territory_owner"] == agent_id)[0].tolist())
 
-    if state["troops_to_place"] > 0:
-        # Still has reinforcement troops to place. Assuming a node has already been picked.
-        if state["selected_node"] == -1:
-            raise RuntimeError(f"Inconsistent world space: selected_node is -1.")
-        current_troops = state["number_of_armies"][state["selected_node"]]
-        mask[1:min(state["troops_to_place"]+1,max_armies-current_troops+1)] = 1
-    else:
-        # No reinforcement troops means this is likely an attack/move action.
-        if state["selected_edge"] == -1:
-            raise RuntimeError(f"Inconsistent world space: selected_edge is -1.")
-        edge = graph.graph["idx_to_edge"][state["selected_edge"]]
-        source_node_armies = state["number_of_armies"][graph.graph["node_to_idx"][edge[0]]]
-        dst = graph.graph["node_to_idx"][graph.graph["idx_to_edge"][state["selected_edge"]][1]]
-        dst_node_armies = state["number_of_armies"][dst]
-        if graph.graph["node_to_idx"][graph.graph["idx_to_edge"][state["selected_edge"]][1]] in owned_nodes:
-            # This is a movement action.
-            mask[1:min(source_node_armies, max_armies-dst_node_armies+1)] = 1
+        if state["troops_to_place"] > 0:
+            # Still has reinforcement troops to place. Assuming a node has already been picked.
+            if state["selected_node"] == -1:
+                raise RuntimeError(f"Inconsistent world space: selected_node is -1.")
+            current_troops = state["number_of_armies"][state["selected_node"]]
+            mask[1:min(state["troops_to_place"]+1,self.max_armies-current_troops+1)] = 1
         else:
-            # This is an attack action.
-            mask[1:min(source_node_armies, 4)] = 1
+            # No reinforcement troops means this is likely an attack/move action.
+            if state["selected_edge"] == -1:
+                raise RuntimeError(f"Inconsistent world space: selected_edge is -1.")
+            edge = self.game_map.graph["idx_to_edge"][state["selected_edge"]]
+            source_node_armies = state["number_of_armies"][self.game_map.graph["node_to_idx"][edge[0]]]
+            dst = self.game_map.graph["node_to_idx"][self.game_map.graph["idx_to_edge"][state["selected_edge"]][1]]
+            dst_node_armies = state["number_of_armies"][dst]
+            if self.game_map.graph["node_to_idx"][self.game_map.graph["idx_to_edge"][state["selected_edge"]][1]] in owned_nodes:
+                # This is a movement action.
+                mask[1:min(source_node_armies, self.max_armies-dst_node_armies+1)] = 1
+            else:
+                # This is an attack action.
+                mask[1:min(source_node_armies, 4)] = 1
 
-    return mask
+        return mask
 
+    @staticmethod
+    def risk_attack_outcome(atk_armies : int, def_armies : int, rng: np.random.Generator = np.random.default_rng()) -> tuple[int, int]:
+        # Given a number of attackers and defenders, returns the number of losses on both sides.
+        atk_dice = min(3, atk_armies)
+        def_dice = min(2, def_armies)
 
-def risk_attack_outcome(atk_armies : int, def_armies : int) -> tuple[int, int]:
-    # Given a number of attackers and defenders, returns the number of losses on both sides.
-    atk_dice_amount = min(3, atk_armies)
-    def_dice_amount = min(2, def_armies)
+        atk_roll = rng.integers(1, 7, size=atk_dice)
+        def_roll = rng.integers(1, 7, size=def_dice)
 
-    atk_roll = np.random.randint(1, 7, size=atk_dice_amount)
-    def_roll = np.random.randint(1, 7, size=def_dice_amount)
+        atk_roll.sort()
+        def_roll.sort()
 
-    atk_roll.sort()
-    def_roll.sort()
+        losses_att = 0
+        losses_def = 0
+        for a, d in zip(reversed(atk_roll), reversed(def_roll)):
+            if a > d:
+                # Attacker has a higher die roll.
+                losses_def += 1
+            else:
+                # Defender has a higher or equal die roll.
+                losses_att += 1
 
-    losses_att = 0
-    losses_def = 0
-    for a, d in zip(reversed(atk_roll), reversed(def_roll)):
-        if a > d:
-            # Attacker has a higher die roll.
-            losses_def += 1
-        else:
-            # Defender has a higher or equal die roll.
-            losses_att += 1
-
-    return losses_att, losses_def
+        return losses_att, losses_def

@@ -5,23 +5,18 @@
 
 from copy import copy, deepcopy
 import functools
-import random
 
 import numpy as np
-import networkx as nx
 
-import gymnasium
 from gymnasium.utils import seeding
 from gymnasium.spaces import Dict
-from supersuit import flatten_v0
 from pettingzoo import AECEnv
 from pettingzoo.utils import AgentSelector, wrappers
 
 from pathlib import Path
 
 from .maps import graph_utils
-from . import risk_utils
-from .risk_utils import RiskPhase
+from .risk_utils import RiskPhase, RiskHelper
 
 # Environment definitions:
 #   (Underlying) Space states:  
@@ -61,29 +56,24 @@ class raw_env(AECEnv):
         self.map_network = graph_utils.generate_graph(map_path)
         self.max_armies = max_armies
         self.max_iters = max_iters
+
+        self.risk_helper = RiskHelper(
+            game_map=self.map_network,
+            num_agents=self.n_agents,
+            max_armies=self.max_armies
+        )
+        
         self._observation_spaces = {
             agent: Dict(
                 {
-                    "observation" : risk_utils.generic_observation_space(
-                        self.map_network,
-                        self.n_agents,
-                        self.max_armies
-                    ),
-                    "action_mask" : risk_utils.generic_mask_space(
-                        self.map_network,
-                        self.n_agents,
-                        self.max_armies
-                    )
+                    "observation" : self.risk_helper.observation_space(),
+                    "action_mask" : self.risk_helper.mask_space()
                 }
             ) for agent in self.possible_agents
         }
         self._action_spaces = Dict(
             {
-                agent: risk_utils.generic_action_space(
-                    self.map_network,
-                    self.n_agents,
-                    self.max_armies
-                ) for agent in self.possible_agents
+                agent: self.risk_helper.action_space() for agent in self.possible_agents
             }
         )
 
@@ -114,10 +104,7 @@ class raw_env(AECEnv):
         self.truncations = {agent: False for agent in self.agents}
         self.infos = {agent: {} for agent in self.agents}
 
-        self.world_state = risk_utils.generate_starting_observation(
-            game_map=self.map_network, 
-            num_agents=self.n_agents
-        )
+        self.world_state = self.risk_helper.starting_observation()
 
         self.state = {
             agent : self.world_state for agent in self.agents
@@ -126,9 +113,7 @@ class raw_env(AECEnv):
         self.observations = {
             agent : {
                 "observation": self.world_state,
-                "action_mask": risk_utils.generate_action_mask(
-                    game_map=self.map_network,
-                    max_armies=self.max_armies,
+                "action_mask": self.risk_helper.generate_action_mask(
                     agent_state=self.world_state,
                     agent_id=idx
                 )
@@ -147,9 +132,7 @@ class raw_env(AECEnv):
         self.observations[agent]["observation"]["troops_to_place"] = np.array(self.observations[agent]["observation"]["troops_to_place"], dtype=np.int16)
         self.observations[agent]["observation"]["selected_node"] = np.array(self.observations[agent]["observation"]["selected_node"], dtype=np.int16)
         self.observations[agent]["observation"]["selected_edge"] = np.array(self.observations[agent]["observation"]["selected_edge"], dtype=np.int16)
-        self.observations[agent]["action_mask"] = risk_utils.generate_action_mask(
-            game_map=self.map_network,
-            max_armies=self.max_armies,
+        self.observations[agent]["action_mask"] = self.risk_helper.generate_action_mask(
             agent_state=self.world_state,
             agent_id=self.agents.index(agent)
         )
@@ -278,7 +261,7 @@ class raw_env(AECEnv):
                             raise RuntimeError(f"Agent {agent} tried to attack with too many troops: {action}")
 
                         dst_amount = self.world_state["number_of_armies"][dst_node]
-                        atk_losses, def_losses = risk_utils.risk_attack_outcome(action, dst_amount)
+                        atk_losses, def_losses = self.risk_helper.risk_attack_outcome(action, dst_amount)
 
                         self.world_state["number_of_armies"][src_node] -= atk_losses
                         self.world_state["number_of_armies"][dst_node] -= def_losses
