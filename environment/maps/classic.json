@@ -1,0 +1,256 @@
+{
+	"name": "Risk: Original (Classic)",
+	"description": "The classic Risk board with 42 territories.",
+    "source": "https://en.wikipedia.org/wiki/Risk_(game)#/media/File:Risk_game_graph.svg",
+	"continents": [
+		{
+			"name": "north_america",
+			"bonus": 5,
+			"territories": [
+				"alaska",
+				"alberta",
+				"central_america",
+				"eastern_united_states",
+				"greenland",
+				"northwest_territory",
+				"ontario",
+				"quebec",
+				"western_united_states"
+			]
+		},
+		{
+			"name": "south_america",
+			"bonus": 2,
+			"territories": [
+				"argentina",
+				"brazil",
+				"peru",
+				"venezuela"
+			]
+		},
+		{
+			"name": "europe",
+			"bonus": 5,
+			"territories": [
+				"great_britain",
+				"iceland",
+				"northern_europe",
+				"scandinavia",
+				"southern_europe",
+				"ukraine",
+				"western_europe"
+			]
+		},
+		{
+			"name": "africa",
+			"bonus": 3,
+			"territories": [
+				"congo",
+				"east_africa",
+				"egypt",
+				"madagascar",
+				"north_africa",
+				"south_africa"
+			]
+		},
+		{
+			"name": "asia",
+			"bonus": 7,
+			"territories": [
+				"afghanistan",
+				"china",
+				"india",
+				"irkutsk",
+				"japan",
+				"kamchatka",
+				"middle_east",
+				"mongolia",
+				"siam",
+				"siberia",
+				"ural",
+				"yakutsk"
+			]
+		},
+		{
+			"name": "australia",
+			"bonus": 2,
+			"territories": [
+				"eastern_australia",
+				"indonesia",
+				"new_guinea",
+				"western_australia"
+			]
+		}
+	],
+	"territories": {
+		"alaska": {
+			"name": "Alaska",
+			"adjacency": ["northwest_territory", "alberta", "kamchatka"]
+		},
+		"northwest_territory": {
+			"name": "Northwest Territory",
+			"adjacency": ["alaska", "alberta", "ontario", "greenland"]
+		},
+		"alberta": {
+			"name": "Alberta",
+			"adjacency": ["alaska", "northwest_territory", "ontario", "western_united_states"]
+		},
+		"ontario": {
+			"name": "Ontario",
+			"adjacency": ["northwest_territory", "alberta", "quebec", "western_united_states", "eastern_united_states", "greenland"]
+		},
+		"quebec": {
+			"name": "Quebec",
+			"adjacency": ["greenland", "ontario", "eastern_united_states"]
+		},
+		"eastern_united_states": {
+			"name": "Eastern United States",
+			"adjacency": ["ontario", "quebec", "western_united_states", "central_america"]
+		},
+		"western_united_states": {
+			"name": "Western United States",
+			"adjacency": ["alberta", "ontario", "eastern_united_states", "central_america"]
+		},
+		"central_america": {
+			"name": "Central America",
+			"adjacency": ["eastern_united_states", "western_united_states", "venezuela"]
+		},
+		"greenland": {
+			"name": "Greenland",
+			"adjacency": ["northwest_territory", "ontario", "quebec", "iceland"]
+		},
+		"venezuela": {
+			"name": "Venezuela",
+			"adjacency": ["central_america", "peru", "brazil"]
+		},
+		"peru": {
+			"name": "Peru",
+			"adjacency": ["argentina", "venezuela", "brazil"]
+		},
+		"brazil": {
+			"name": "Brazil",
+			"adjacency": ["venezuela", "peru", "argentina", "north_africa"]
+		},
+		"argentina": {
+			"name": "Argentina",
+			"adjacency": ["peru", "brazil"]
+		},
+		"great_britain": {
+			"name": "Great Britain",
+			"adjacency": ["iceland", "northern_europe", "scandinavia", "western_europe"]
+		},
+		"iceland": {
+			"name": "Iceland",
+			"adjacency": ["greenland", "great_britain", "scandinavia"]
+		},
+		"northern_europe": {
+			"name": "Northern Europe",
+			"adjacency": ["great_britain", "scandinavia", "southern_europe", "ukraine", "western_europe"]
+		},
+		"scandinavia": {
+			"name": "Scandinavia",
+			"adjacency": ["great_britain", "northern_europe", "ukraine", "iceland"]
+		},
+		"southern_europe": {
+			"name": "Southern Europe",
+			"adjacency": ["north_africa", "northern_europe", "egypt", "ukraine", "western_europe", "middle_east"]
+		},
+		"ukraine": {
+			"name": "Ukraine",
+			"adjacency": ["northern_europe", "scandinavia", "southern_europe", "afghanistan", "middle_east", "ural"]
+		},
+		"western_europe": {
+			"name": "Western Europe",
+			"adjacency": ["great_britain", "northern_europe", "southern_europe", "north_africa"]
+		},
+		"congo": {
+			"name": "Congo",
+			"adjacency": ["east_africa", "north_africa", "south_africa"]
+		},
+		"east_africa": {
+			"name": "East Africa",
+			"adjacency": ["congo", "egypt", "madagascar", "south_africa", "north_africa", "middle_east"]
+		},
+		"egypt": {
+			"name": "Egypt",
+			"adjacency": ["southern_europe", "east_africa", "north_africa", "middle_east"]
+		},
+		"madagascar": {
+			"name": "Madagascar",
+			"adjacency": ["east_africa", "south_africa"]
+		},
+		"north_africa": {
+			"name": "North Africa",
+			"adjacency": ["brazil", "congo", "egypt", "east_africa", "western_europe", "southern_europe"]
+		},
+		"south_africa": {
+			"name": "South Africa",
+			"adjacency": ["congo", "east_africa", "madagascar"]
+		},
+		"afghanistan": {
+			"name": "Afghanistan",
+			"adjacency": ["ukraine", "china", "india", "middle_east", "ural"]
+		},
+		"china": {
+			"name": "China",
+			"adjacency": ["afghanistan", "india", "mongolia", "siberia", "ural", "siam"]
+		},
+		"india": {
+			"name": "India",
+			"adjacency": ["afghanistan", "china", "middle_east", "siam"]
+		},
+		"irkutsk": {
+			"name": "Irkutsk",
+			"adjacency": ["yakutsk", "siberia", "mongolia", "kamchatka"]
+		},
+		"japan": {
+			"name": "Japan",
+			"adjacency": ["kamchatka", "mongolia"]
+		},
+		"kamchatka": {
+			"name": "Kamchatka",
+			"adjacency": ["japan", "mongolia", "irkutsk", "yakutsk", "alaska"]
+		},
+		"middle_east": {
+			"name": "Middle East",
+			"adjacency": ["southern_europe", "ukraine", "egypt", "east_africa", "india", "afghanistan"]
+		},
+		"mongolia": {
+			"name": "Mongolia",
+			"adjacency": ["china", "kamchatka", "siberia", "irkutsk", "japan"]
+		},
+		"siam": {
+			"name": "Siam",
+			"adjacency": ["indonesia", "india", "china"]
+		},
+		"siberia": {
+			"name": "Siberia",
+			"adjacency": ["china", "mongolia", "irkutsk", "yakutsk", "ural"]
+		},
+		"ural": {
+			"name": "Ural",
+			"adjacency": ["ukraine", "siberia", "afghanistan", "china"]
+		},
+		"yakutsk": {
+			"name": "Yakutsk",
+			"adjacency": ["siberia", "kamchatka", "irkutsk"]
+		},
+		"eastern_australia": {
+			"name": "Eastern Australia",
+			"adjacency": ["new_guinea", "western_australia"]
+		},
+		"indonesia": {
+			"name": "Indonesia",
+			"adjacency": ["new_guinea", "siam", "western_australia"]
+		},
+		"new_guinea": {
+			"name": "New Guinea",
+			"adjacency": ["indonesia", "eastern_australia", "western_australia"]
+		},
+		"western_australia": {
+			"name": "Western Australia",
+			"adjacency": ["eastern_australia", "indonesia", "new_guinea"]
+		}
+	}
+}
+  
