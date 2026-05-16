@@ -1,0 +1,14 @@
+[project]
+name = "risk-rl"
+version = "0.0.1"
+readme = "README.md"
+requires-python = "3.10.19"
+
+dependencies = [
+    "pettingzoo~=1.26.0",
+    "numpy~=2.2.6",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
