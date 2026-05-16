@@ -16,19 +16,20 @@ from pettingzoo.utils import AgentSelector, wrappers
 from pathlib import Path
 
 from .maps import graph_utils
-from .risk_utils import CardTypes, RiskPhase, RiskHelper
+from .risk_utils import CardTypes, RiskPhase, RiskHelper, TradeChoices
 
 # Environment definitions:
 #   (Underlying) Space states:  
 #       - Ownership of territories (part of observation)
 #       - Amount of armies in each territory (part of observation)
 #       - Action phase (0: initial placing, 1: select army count, 2: select node, 3: select edge)
-#       - Cards in hand (partial observability of each agent) (TBI)
+#       - Cards in hand (partial observability of each agent)
 #   Actions:
 #       The actions are defined based on the state, they could represent, based on the phase:
 #       - Node ID to pick
 #       - Edge ID to pick
 #       - Number of armies to use
+#       - Type of card trade to perform
 
 NUM_AGENTS = 2
 MAX_ARMIES = 100
@@ -320,6 +321,7 @@ class raw_env(AECEnv):
 
             case RiskPhase.TRADE_CARDS:
                 self.world_state["troops_to_place"] += self.risk_helper.cards_trade_amount(action)
+                self._update_cards(agent_idx=agent_idx, action=action)
                 self.world_state["action_phase"] = int(RiskPhase.SELECT_NODE)
                 return False
                 
@@ -342,3 +344,31 @@ class raw_env(AECEnv):
                 continents_armies += amount_continent
     
         return (territory_armies + continents_armies)
+
+    def _update_cards(self, agent_idx : int, action : int | TradeChoices):
+        match action:
+            case TradeChoices.NO_OP:
+                return
+            case TradeChoices.TRADE_ARTILLERY:
+                self.world_state["cards_in_hand"][agent_idx][int(CardTypes.ARTILLERY)] -= 3
+            case TradeChoices.TRADE_INFANTRY:
+                self.world_state["cards_in_hand"][agent_idx][int(CardTypes.INFANTRY)] -= 3
+            case TradeChoices.TRADE_CAVALRY:
+                self.world_state["cards_in_hand"][agent_idx][int(CardTypes.CAVALRY)] -= 3
+            case TradeChoices.TRADE_MIXED:
+                self.world_state["cards_in_hand"][agent_idx][int(CardTypes.ARTILLERY)] -= 1
+                self.world_state["cards_in_hand"][agent_idx][int(CardTypes.INFANTRY)] -= 1
+                self.world_state["cards_in_hand"][agent_idx][int(CardTypes.CAVALRY)] -= 1
+            case TradeChoices.TRADE_JOKER:
+                has_two_cards = self.world_state["cards_in_hand"][agent_idx] >= 2
+                self.world_state["cards_in_hand"][agent_idx][int(CardTypes.JOKER)] -= 1
+                for card_type in CardTypes:
+                    if card_type == CardTypes.JOKER:
+                        continue
+                    if has_two_cards[card_type]:
+                        self.world_state["cards_in_hand"][agent_idx][card_type] -= 2
+                        break
+            case _:
+                raise ValueError(f"Undefined trade choice: {action}")
+                
+        return
