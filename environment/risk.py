@@ -52,7 +52,8 @@ class raw_env(AECEnv):
     def __init__(self, render_mode=None, n_agents : int = NUM_AGENTS, map_path : Path | None = None, 
                  max_armies : int = MAX_ARMIES, max_iters : int = MAX_ITERS, is_card_game : bool = IS_CARD_GAME):
 
-        self.possible_agents = ["player_" + str(r) for r in range(n_agents)]
+        self.agents = ["player_" + str(r) for r in range(n_agents)]
+        self.possible_agents = self.agents[:]
         self.n_agents = n_agents
         self.map_network = graph_utils.generate_graph(map_path)
         self.max_armies = max_armies
@@ -81,6 +82,15 @@ class raw_env(AECEnv):
         )
 
         self.continent_masks = self.risk_helper._generate_continent_masks()
+
+        self.rewards = {agent: 0 for agent in self.agents}
+        self._cumulative_rewards = {agent: 0 for agent in self.agents}
+        self.terminations = {agent: False for agent in self.agents}
+        self.truncations = {agent: False for agent in self.agents}
+        self.infos = {agent: {} for agent in self.agents}
+
+        self._agent_selector = AgentSelector(self.agents)
+        self.agent_selection = self._agent_selector.reset()
 
         self.render_mode = render_mode
 
@@ -129,7 +139,7 @@ class raw_env(AECEnv):
 
         self.has_conquered_this_turn = False
 
-        self._agent_selector = AgentSelector(self.agents)
+        self._agent_selector.reinit(self.agents)
         self.agent_selection = self._agent_selector.reset()
 
 
