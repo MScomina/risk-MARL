@@ -1,7 +1,5 @@
 # https://gymnasium.farama.org/api/env/
-# https://gymnasium.farama.org/api/spaces/
 # https://pettingzoo.farama.org/content/environment_creation/
-# Inspiration for environment (masking): https://github.com/Farama-Foundation/PettingZoo/blob/master/pettingzoo/classic/chess/chess.py
 
 from copy import copy, deepcopy
 import functools
@@ -16,7 +14,7 @@ from pettingzoo.utils import AgentSelector, wrappers
 from pathlib import Path
 
 from .maps import graph_utils
-from .risk_utils import CardTypes, RiskPhase, RiskHelper, TradeChoices
+from .risk_utils import CardTypes, FlattenObservationWrapper, RiskPhase, RiskHelper, TradeChoices
 
 # Environment definitions:
 #   (Underlying) Space states:  
@@ -36,12 +34,13 @@ MAX_ARMIES = 100
 MAX_ITERS = 10_000
 IS_CARD_GAME = True
 
-
-def env(**kwargs) -> AECEnv:
+def env(should_flatten_obs : bool = True, **kwargs) -> AECEnv:
     env = raw_env(**kwargs)
     env = wrappers.TerminateIllegalWrapper(env, illegal_reward=-1)
     env = wrappers.AssertOutOfBoundsWrapper(env)
     env = wrappers.OrderEnforcingWrapper(env)
+    if should_flatten_obs:
+        env = FlattenObservationWrapper(env)
     return env
 
 
