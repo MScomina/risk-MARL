@@ -1,3 +1,6 @@
+# https://gymnasium.farama.org/api/spaces/
+# Inspiration for environment (masking): https://github.com/Farama-Foundation/PettingZoo/blob/master/pettingzoo/classic/chess/chess.py
+
 import networkx as nx
 import numpy as np
 
@@ -6,7 +9,10 @@ from .maps import graph_utils
 import functools
 from enum import IntEnum
 
-from gymnasium.spaces import Box, Dict, Discrete
+from pettingzoo import AECEnv
+from pettingzoo.utils.wrappers import BaseWrapper
+
+from gymnasium.spaces import Box, Dict, Discrete, Space
 
 # State/observation spaces info:
 #   territory_owner: The owner of the territory, -1 if owned by nobody.
@@ -43,7 +49,78 @@ class RiskPhase(IntEnum):
     SELECT_EDGE = 3
     TRADE_CARDS = 4
 
+class FlattenObservationWrapper(BaseWrapper):
+    
+    def __init__(self, env: AECEnv):
+        super().__init__(env)
+        
+        self._observation_spaces = {}
+        
+        for agent in env.possible_agents:
+            orig_space = env.observation_space(agent)
+            
+            if isinstance(orig_space, Dict) and "observation" in orig_space.spaces:
+                sub_space = orig_space.spaces["observation"]
+                flat_dim = 0
+                
+                for key, subspace in sub_space.spaces.items():
+                    if isinstance(subspace, Box):
+                        flat_dim += int(np.prod(subspace.shape))
+                    elif isinstance(subspace, Discrete):
+                        flat_dim += 1
+                    else:
+                        raise TypeError(f"Unsupported sub-space type: {type(subspace)}")
+                
+                flat_obs_space = Box(low=-1, high=32767, shape=(flat_dim,), dtype=np.int16)
+                
+                self._observation_spaces[agent] = Dict({
+                    "observation": flat_obs_space,
+                    "action_mask": orig_space.spaces["action_mask"]
+                })
+            else:
+                self._observation_spaces[agent] = orig_space
+
+    def observation_space(self, agent) -> Space:
+        return self._observation_spaces[agent]
+
+    def observe(self, agent) -> dict:
+        orig_obs = self.env.observe(agent)
+        if orig_obs is None:
+            return None
+            
+        obs_dict = orig_obs["observation"]
+        flat_parts = []
+        
+        for key, value in obs_dict.items():
+            if isinstance(value, np.ndarray):
+                flat_parts.append(value.ravel())
+            else:
+                flat_parts.append(np.array([value], dtype=np.int16))
+                
+        output_dict = {
+            "observation": np.concatenate(flat_parts).astype(np.int16),
+            "action_mask": orig_obs["action_mask"]
+        }
+        return output_dict
+
+
 class RiskHelper():
+
+    _TRADE_AMOUNTS : dict[int | TradeChoices, int] = {
+        TradeChoices.NO_OP: 0,
+        TradeChoices.TRADE_ARTILLERY: 4,
+        TradeChoices.TRADE_INFANTRY: 6,
+        TradeChoices.TRADE_CAVALRY: 8,
+        TradeChoices.TRADE_MIXED: 10,
+        TradeChoices.TRADE_JOKER: 12
+    }
+
+    _CARD_DRAW_WEIGHTS : dict[int | CardTypes, int] = {
+        CardTypes.ARTILLERY: 15,
+        CardTypes.INFANTRY: 15,
+        CardTypes.CAVALRY: 10,
+        CardTypes.JOKER: 2
+    }
 
     def __init__(self, game_map : nx.DiGraph, num_agents : int, max_armies : int, is_card_game : bool):
 
@@ -60,12 +137,12 @@ class RiskHelper():
     def observation_space(self) -> Dict:
 
         observation_base = {
-                "territory_owner": Box(low=-1, high=self.num_agents, shape=(self.num_nodes, ), dtype=np.int8),
-                "number_of_armies": Box(low=0, high=self.max_armies+1, shape=(self.num_nodes, ), dtype=np.int16),
-                "action_phase" : Discrete(len(RiskPhase), dtype=np.int8),
-                "troops_to_place" : Discrete(self.max_armies, dtype=np.int16),
-                "selected_node": Discrete(self.num_nodes+1, start=-1, dtype=np.int16),
-                "selected_edge": Discrete(self.num_edges+1, start=-1, dtype=np.int16),
+            "territory_owner": Box(low=-1, high=self.num_agents, shape=(self.num_nodes, ), dtype=np.int8),
+            "number_of_armies": Box(low=0, high=self.max_armies+1, shape=(self.num_nodes, ), dtype=np.int16),
+            "action_phase" : Discrete(len(RiskPhase), dtype=np.int8),
+            "troops_to_place" : Discrete(self.max_armies, dtype=np.int16),
+            "selected_node": Discrete(self.num_nodes+1, start=-1, dtype=np.int16),
+            "selected_edge": Discrete(self.num_edges+1, start=-1, dtype=np.int16),
         }
 
         if self.is_card_game:
@@ -96,7 +173,7 @@ class RiskHelper():
 
     def action_space(self) -> Dict:
 
-        return Discrete(self.mask_size, dtype=np.int32)
+        return Discrete(self.mask_size, dtype=np.int64)
 
     def mask_space(self) -> Dict:
 
@@ -147,7 +224,7 @@ class RiskHelper():
 
     
     def _mask_starting_placement(self, state : dict) -> np.ndarray:
-    # Still placing at the start, can place one in ANY UNOWNED territories.
+        # Still placing at the start, can place one in ANY UNOWNED territories.
         return (state["territory_owner"] == -1).astype(np.int8)
 
     def _mask_select_node(self, agent_id : int, state : dict) -> np.ndarray:
@@ -222,14 +299,14 @@ class RiskHelper():
         
         mask = np.zeros(len(TradeChoices), dtype=np.int8)
 
-        normal_cards_counts = state["cards_in_hand"][agent_id][[CardTypes.INFANTRY.value, CardTypes.CAVALRY.value, CardTypes.ARTILLERY.value]]
+        normal_cards_counts = state["cards_in_hand"][agent_id][[CardTypes.INFANTRY, CardTypes.CAVALRY, CardTypes.ARTILLERY]]
 
-        mask[TradeChoices.NO_OP.value] = 1
-        mask[TradeChoices.TRADE_ARTILLERY.value] = int(state["cards_in_hand"][agent_id][CardTypes.ARTILLERY.value] >= 3)
-        mask[TradeChoices.TRADE_INFANTRY.value] = int(state["cards_in_hand"][agent_id][CardTypes.INFANTRY.value] >= 3)
-        mask[TradeChoices.TRADE_CAVALRY.value] = int(state["cards_in_hand"][agent_id][CardTypes.CAVALRY.value] >= 3)
-        mask[TradeChoices.TRADE_MIXED.value] = int((normal_cards_counts >= 1).all())
-        mask[TradeChoices.TRADE_JOKER.value] = int(state["cards_in_hand"][agent_id][CardTypes.JOKER.value] >= 1 and (normal_cards_counts >= 2).any())
+        mask[TradeChoices.NO_OP] = 1
+        mask[TradeChoices.TRADE_ARTILLERY] = int(state["cards_in_hand"][agent_id][CardTypes.ARTILLERY] >= 3)
+        mask[TradeChoices.TRADE_INFANTRY] = int(state["cards_in_hand"][agent_id][CardTypes.INFANTRY] >= 3)
+        mask[TradeChoices.TRADE_CAVALRY] = int(state["cards_in_hand"][agent_id][CardTypes.CAVALRY] >= 3)
+        mask[TradeChoices.TRADE_MIXED] = int((normal_cards_counts >= 1).all())
+        mask[TradeChoices.TRADE_JOKER] = int(state["cards_in_hand"][agent_id][CardTypes.JOKER] >= 1 and (normal_cards_counts >= 2).any())
 
         return mask
 
@@ -247,30 +324,16 @@ class RiskHelper():
 
     @staticmethod
     def cards_trade_amount(trade_type : int | TradeChoices) -> int:
-        match trade_type:
-            case TradeChoices.NO_OP:
-                return 0
-            case TradeChoices.TRADE_ARTILLERY:
-                return 4
-            case TradeChoices.TRADE_INFANTRY:
-                return 6
-            case TradeChoices.TRADE_CAVALRY:
-                return 8
-            case TradeChoices.TRADE_MIXED:
-                return 10
-            case TradeChoices.TRADE_JOKER:
-                return 12
-            case _:
-                raise ValueError(f"Undefined trade amount called: {trade_type}")
-        return 0
+        return RiskHelper._TRADE_AMOUNTS[trade_type]
 
     @staticmethod
     def draw_card(rng : np.random.Generator = np.random.default_rng()) -> int:
         # If one wants to develop an actual drawing setup with a deck, this function is to change.
         # For simplicity, it has just been reduced to drawing from a RNG generator.
-        weights = [15, 15, 10, 2]
+        card_types = list(RiskHelper._CARD_DRAW_WEIGHTS.keys())
+        weights = list(RiskHelper._CARD_DRAW_WEIGHTS.values())
         probs = [w / sum(weights) for w in weights]
-        return CardTypes(rng.choice(len(weights), p=probs))
+        return rng.choice(card_types, p=probs)
 
 
     @staticmethod

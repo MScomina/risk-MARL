@@ -1,7 +1,5 @@
 # https://gymnasium.farama.org/api/env/
-# https://gymnasium.farama.org/api/spaces/
 # https://pettingzoo.farama.org/content/environment_creation/
-# Inspiration for environment (masking): https://github.com/Farama-Foundation/PettingZoo/blob/master/pettingzoo/classic/chess/chess.py
 
 from copy import copy, deepcopy
 import functools
@@ -16,7 +14,7 @@ from pettingzoo.utils import AgentSelector, wrappers
 from pathlib import Path
 
 from .maps import graph_utils
-from .risk_utils import CardTypes, RiskPhase, RiskHelper, TradeChoices
+from .risk_utils import CardTypes, FlattenObservationWrapper, RiskPhase, RiskHelper, TradeChoices
 
 # Environment definitions:
 #   (Underlying) Space states:  
@@ -36,12 +34,13 @@ MAX_ARMIES = 100
 MAX_ITERS = 10_000
 IS_CARD_GAME = True
 
-
-def env(**kwargs) -> AECEnv:
+def env(should_flatten_obs : bool = False, **kwargs) -> AECEnv:
     env = raw_env(**kwargs)
     env = wrappers.TerminateIllegalWrapper(env, illegal_reward=-1)
     env = wrappers.AssertOutOfBoundsWrapper(env)
     env = wrappers.OrderEnforcingWrapper(env)
+    if should_flatten_obs:
+        env = FlattenObservationWrapper(env)
     return env
 
 
@@ -52,7 +51,8 @@ class raw_env(AECEnv):
     def __init__(self, render_mode=None, n_agents : int = NUM_AGENTS, map_path : Path | None = None, 
                  max_armies : int = MAX_ARMIES, max_iters : int = MAX_ITERS, is_card_game : bool = IS_CARD_GAME):
 
-        self.possible_agents = ["player_" + str(r) for r in range(n_agents)]
+        self.agents = ["player_" + str(r) for r in range(n_agents)]
+        self.possible_agents = self.agents[:]
         self.n_agents = n_agents
         self.map_network = graph_utils.generate_graph(map_path)
         self.max_armies = max_armies
@@ -81,6 +81,16 @@ class raw_env(AECEnv):
         )
 
         self.continent_masks = self.risk_helper._generate_continent_masks()
+
+        self.rewards = {agent: 0 for agent in self.agents}
+        self._cumulative_rewards = {agent: 0 for agent in self.agents}
+        self.terminations = {agent: False for agent in self.agents}
+        self.truncations = {agent: False for agent in self.agents}
+        self.infos = {agent: {} for agent in self.agents}
+
+        self._agent_selector = AgentSelector(self.agents)
+        self.agent_selection = self._agent_selector.reset()
+        self.current_agent_idx = 0
 
         self.render_mode = render_mode
 
@@ -129,11 +139,13 @@ class raw_env(AECEnv):
 
         self.has_conquered_this_turn = False
 
-        self._agent_selector = AgentSelector(self.agents)
+        self._agent_selector.reinit(self.agents)
         self.agent_selection = self._agent_selector.reset()
+        self.current_agent_idx = self.agents.index(self.agent_selection)
 
 
     def observe(self, agent : str):
+        agent_idx = self.agents.index(agent)
         self.observations[agent]["observation"] = deepcopy(self.world_state)
 
         self.observations[agent]["observation"]["action_phase"] = np.array(self.observations[agent]["observation"]["action_phase"], dtype=np.int8)
@@ -141,14 +153,14 @@ class raw_env(AECEnv):
         self.observations[agent]["observation"]["selected_node"] = np.array(self.observations[agent]["observation"]["selected_node"], dtype=np.int16)
         self.observations[agent]["observation"]["selected_edge"] = np.array(self.observations[agent]["observation"]["selected_edge"], dtype=np.int16)
         if self.is_card_game:
-            self.observations[agent]["observation"]["cards_in_hand"] = self.world_state["cards_in_hand"][self.agents.index(agent)]
+            self.observations[agent]["observation"]["cards_in_hand"] = self.world_state["cards_in_hand"][agent_idx]
             hand_counts = np.sum(self.world_state["cards_in_hand"], axis=1).astype(np.int16)
-            hand_counts = np.delete(hand_counts, self.agents.index(agent))
+            hand_counts = np.delete(hand_counts, agent_idx)
             self.observations[agent]["observation"]["amount_cards_others"] = hand_counts
 
         self.observations[agent]["action_mask"] = self.risk_helper.generate_action_mask(
             agent_state=self.world_state,
-            agent_id=self.agents.index(agent)
+            agent_id=agent_idx
         )
         return self.observations[agent]
 
@@ -164,7 +176,7 @@ class raw_env(AECEnv):
             return
 
         current_agent = self.agent_selection
-        current_index = self.agents.index(current_agent)
+        self.current_agent_idx = self.agents.index(current_agent)
 
         current_obs = self.observe(current_agent)
         legal_mask = current_obs["action_mask"]
@@ -173,7 +185,7 @@ class raw_env(AECEnv):
 
         should_end_turn = self._update_state(current_agent, action)
 
-        if np.all(self.world_state["territory_owner"] == current_index):
+        if np.all(self.world_state["territory_owner"] == self.current_agent_idx):
             for agent in self.agents:
                 if agent == current_agent:
                     self.rewards[agent] = 1
@@ -188,6 +200,7 @@ class raw_env(AECEnv):
                 next_agent = self._agent_selector.next()
                 
             self.agent_selection = next_agent
+            self.current_agent_idx = self.agents.index(self.agent_selection)
             if not self.world_state["action_phase"] == RiskPhase.STARTING_PLACEMENT:
                 self.world_state["troops_to_place"] = self._compute_reinforcements(self.agent_selection)
             self.has_conquered_this_turn = False
@@ -205,51 +218,50 @@ class raw_env(AECEnv):
 
     def _update_state(self, agent : str, action : dict) -> bool:
 
-        agent_idx = self.agents.index(agent)
         # Updates the state and returns whether the turn is over or not.
         match self.world_state["action_phase"]:
 
             case RiskPhase.STARTING_PLACEMENT:
                 if self.world_state["territory_owner"][action] != -1:
                     raise RuntimeError(f"Agent {agent} tried to own an already owned territory: {action}")
-                self.world_state["territory_owner"][action] = agent_idx
+                self.world_state["territory_owner"][action] = self.current_agent_idx
                 self.world_state["number_of_armies"][action] = 1
                 if np.all(self.world_state["territory_owner"] != -1):
                     # All nodes have been taken, reinforcement has begun.
-                    self.world_state["action_phase"] = int(RiskPhase.SELECT_NODE)
+                    self.world_state["action_phase"] = RiskPhase.SELECT_NODE
                 return True
 
             case RiskPhase.SELECT_NODE:
                 if action == self.map_network.number_of_nodes():
                     # No-op operation, either because agent is dead or all nodes are filled. Skip to next phase.
                     self.world_state["troops_to_place"] = 0
-                    self.world_state["action_phase"] = int(RiskPhase.SELECT_EDGE)
+                    self.world_state["action_phase"] = RiskPhase.SELECT_EDGE
                     return False
                 if action > self.map_network.number_of_nodes():
                     raise RuntimeError(f"Agent {agent} tried to pick a node index greater than the number of nodes: {action}")
-                if self.world_state["territory_owner"][action] != agent_idx:
+                if self.world_state["territory_owner"][action] != self.current_agent_idx:
                     raise RuntimeError(f"Agent {agent} tried to pick another player's territory for action: {action}")
                 self.world_state["selected_node"] = action
-                self.world_state["action_phase"] = int(RiskPhase.SELECT_ARMY_COUNT)
+                self.world_state["action_phase"] = RiskPhase.SELECT_ARMY_COUNT
                 return False
             
             case RiskPhase.SELECT_EDGE:
                 if action == self.map_network.number_of_edges():
                     # No-op operation (no actions available, must pass turn)
                     if self.is_card_game:
-                        self.world_state["action_phase"] = int(RiskPhase.TRADE_CARDS)
+                        self.world_state["action_phase"] = RiskPhase.TRADE_CARDS
                     else:
-                        self.world_state["action_phase"] = int(RiskPhase.SELECT_NODE)
+                        self.world_state["action_phase"] = RiskPhase.SELECT_NODE
                     self.world_state["selected_edge"] = -1
                     return True
                 if action > self.map_network.number_of_edges():
                     raise RuntimeError(f"Agent {agent} tried to pick an edge index greater than the number of edges: {action}")
                 edge = self.map_network.graph["idx_to_edge"][action]
                 src_node = self.map_network.graph["node_to_idx"][edge[0]]
-                if self.world_state["territory_owner"][src_node] != agent_idx:
+                if self.world_state["territory_owner"][src_node] != self.current_agent_idx:
                     raise RuntimeError(f"Agent {agent} tried to pick an invalid edge ({src_node} is owned by {self.world_state['territory_owner'][src_node]}): {action}")
                 self.world_state["selected_edge"] = action
-                self.world_state["action_phase"] = int(RiskPhase.SELECT_ARMY_COUNT)
+                self.world_state["action_phase"] = RiskPhase.SELECT_ARMY_COUNT
                 return False
 
             case RiskPhase.SELECT_ARMY_COUNT:
@@ -261,9 +273,9 @@ class raw_env(AECEnv):
                     self.world_state["number_of_armies"][self.world_state["selected_node"]] += action
                     self.world_state["troops_to_place"] -= action
                     if self.world_state["troops_to_place"] > 0:
-                        self.world_state["action_phase"] = int(RiskPhase.SELECT_NODE)
+                        self.world_state["action_phase"] = RiskPhase.SELECT_NODE
                     else:
-                        self.world_state["action_phase"] = int(RiskPhase.SELECT_EDGE)
+                        self.world_state["action_phase"] = RiskPhase.SELECT_EDGE
                     self.world_state["selected_node"] = -1
                     return False
 
@@ -273,7 +285,7 @@ class raw_env(AECEnv):
                     src_node = self.map_network.graph["node_to_idx"][self.map_network.graph["idx_to_edge"][self.world_state["selected_edge"]][0]]
                     dst_node = self.map_network.graph["node_to_idx"][self.map_network.graph["idx_to_edge"][self.world_state["selected_edge"]][1]]
 
-                    if self.world_state["territory_owner"][dst_node] != agent_idx:
+                    if self.world_state["territory_owner"][dst_node] != self.current_agent_idx:
                         # Attacking.
                         if action == 0 or action > min(3,self.world_state["number_of_armies"][src_node]-1):
                             raise RuntimeError(f"Agent {agent} tried to attack with too many troops: {action}")
@@ -288,9 +300,9 @@ class raw_env(AECEnv):
                             # No troops left, control switches.
                             previous_owner = self.world_state["territory_owner"][dst_node]
                             if not self.has_conquered_this_turn and self.is_card_game:
-                                self.world_state["cards_in_hand"][agent_idx][self.risk_helper.draw_card()] += 1
+                                self.world_state["cards_in_hand"][self.current_agent_idx][self.risk_helper.draw_card()] += 1
                                 self.has_conquered_this_turn = True
-                            self.world_state["territory_owner"][dst_node] = agent_idx
+                            self.world_state["territory_owner"][dst_node] = self.current_agent_idx
                             self.world_state["number_of_armies"][dst_node] += action - atk_losses
                             self.world_state["number_of_armies"][src_node] -= action - atk_losses
                             should_terminate = True
@@ -299,10 +311,10 @@ class raw_env(AECEnv):
                                     should_terminate = False
                             self.terminations[self.agents[previous_owner]] = should_terminate
                             if should_terminate and self.is_card_game:
-                                self.world_state["cards_in_hand"][agent_idx] += self.world_state["cards_in_hand"][previous_owner]
+                                self.world_state["cards_in_hand"][self.current_agent_idx] += self.world_state["cards_in_hand"][previous_owner]
                                 self.world_state["cards_in_hand"][previous_owner] = np.zeros(len(CardTypes), dtype=np.int16)
                         
-                        self.world_state["action_phase"] = int(RiskPhase.SELECT_EDGE)
+                        self.world_state["action_phase"] = RiskPhase.SELECT_EDGE
                         self.world_state["selected_edge"] = -1
                         return False
                     
@@ -313,16 +325,16 @@ class raw_env(AECEnv):
                         self.world_state["number_of_armies"][src_node] -= action
                         self.world_state["number_of_armies"][dst_node] += action
                         if self.is_card_game:
-                            self.world_state["action_phase"] = int(RiskPhase.TRADE_CARDS)
+                            self.world_state["action_phase"] = RiskPhase.TRADE_CARDS
                         else:
-                            self.world_state["action_phase"] = int(RiskPhase.SELECT_NODE)
+                            self.world_state["action_phase"] = RiskPhase.SELECT_NODE
                         self.world_state["selected_edge"] = -1
                         return True
 
             case RiskPhase.TRADE_CARDS:
                 self.world_state["troops_to_place"] += self.risk_helper.cards_trade_amount(action)
-                self._update_cards(agent_idx=agent_idx, action=action)
-                self.world_state["action_phase"] = int(RiskPhase.SELECT_NODE)
+                self._update_cards(action=action)
+                self.world_state["action_phase"] = RiskPhase.SELECT_NODE
                 return False
                 
             case _:
@@ -332,41 +344,40 @@ class raw_env(AECEnv):
     
     def _compute_reinforcements(self, agent : str) -> int:
 
-        agent_idx = self.agents.index(agent)
-        troops_owned_territories = np.count_nonzero(self.world_state["territory_owner"] == agent_idx)
+        troops_owned_territories = np.count_nonzero(self.world_state["territory_owner"] == self.current_agent_idx)
         territory_armies = max(3, troops_owned_territories//3)
 
         continents_armies = 0
         for continent, continent_values in self.map_network.graph["continents"].items():
             amount_continent = continent_values["bonus"]
             continent_mask = self.continent_masks[continent]
-            if np.all(self.world_state["territory_owner"][continent_mask] == agent_idx):
+            if np.all(self.world_state["territory_owner"][continent_mask] == self.current_agent_idx):
                 continents_armies += amount_continent
     
         return (territory_armies + continents_armies)
 
-    def _update_cards(self, agent_idx : int, action : int | TradeChoices):
+    def _update_cards(self, action : int | TradeChoices):
         match action:
             case TradeChoices.NO_OP:
                 return
             case TradeChoices.TRADE_ARTILLERY:
-                self.world_state["cards_in_hand"][agent_idx][int(CardTypes.ARTILLERY)] -= 3
+                self.world_state["cards_in_hand"][self.current_agent_idx][CardTypes.ARTILLERY] -= 3
             case TradeChoices.TRADE_INFANTRY:
-                self.world_state["cards_in_hand"][agent_idx][int(CardTypes.INFANTRY)] -= 3
+                self.world_state["cards_in_hand"][self.current_agent_idx][CardTypes.INFANTRY] -= 3
             case TradeChoices.TRADE_CAVALRY:
-                self.world_state["cards_in_hand"][agent_idx][int(CardTypes.CAVALRY)] -= 3
+                self.world_state["cards_in_hand"][self.current_agent_idx][CardTypes.CAVALRY] -= 3
             case TradeChoices.TRADE_MIXED:
-                self.world_state["cards_in_hand"][agent_idx][int(CardTypes.ARTILLERY)] -= 1
-                self.world_state["cards_in_hand"][agent_idx][int(CardTypes.INFANTRY)] -= 1
-                self.world_state["cards_in_hand"][agent_idx][int(CardTypes.CAVALRY)] -= 1
+                self.world_state["cards_in_hand"][self.current_agent_idx][CardTypes.ARTILLERY] -= 1
+                self.world_state["cards_in_hand"][self.current_agent_idx][CardTypes.INFANTRY] -= 1
+                self.world_state["cards_in_hand"][self.current_agent_idx][CardTypes.CAVALRY] -= 1
             case TradeChoices.TRADE_JOKER:
-                has_two_cards = self.world_state["cards_in_hand"][agent_idx] >= 2
-                self.world_state["cards_in_hand"][agent_idx][int(CardTypes.JOKER)] -= 1
+                has_two_cards = self.world_state["cards_in_hand"][self.current_agent_idx] >= 2
+                self.world_state["cards_in_hand"][self.current_agent_idx][CardTypes.JOKER] -= 1
                 for card_type in CardTypes:
                     if card_type == CardTypes.JOKER:
                         continue
                     if has_two_cards[card_type]:
-                        self.world_state["cards_in_hand"][agent_idx][card_type] -= 2
+                        self.world_state["cards_in_hand"][self.current_agent_idx][card_type] -= 2
                         break
             case _:
                 raise ValueError(f"Undefined trade choice: {action}")
