@@ -146,17 +146,27 @@ class raw_env(AECEnv):
 
     def observe(self, agent : str):
         agent_idx = self.agents.index(agent)
-        self.observations[agent]["observation"] = deepcopy(self.world_state)
 
-        self.observations[agent]["observation"]["action_phase"] = np.array(self.observations[agent]["observation"]["action_phase"], dtype=np.int8)
-        self.observations[agent]["observation"]["troops_to_place"] = np.array(self.observations[agent]["observation"]["troops_to_place"], dtype=np.int16)
-        self.observations[agent]["observation"]["selected_node"] = np.array(self.observations[agent]["observation"]["selected_node"], dtype=np.int16)
-        self.observations[agent]["observation"]["selected_edge"] = np.array(self.observations[agent]["observation"]["selected_edge"], dtype=np.int16)
+        self.observations[agent]["observation"] = deepcopy(self.world_state)
+        obs_dict = self.observations[agent]["observation"]
+
+        absolute_owners = obs_dict["territory_owner"]
+        relative_owners = np.where(
+            absolute_owners >= 0,
+            (absolute_owners - agent_idx) % self.num_agents,
+            absolute_owners
+        )
+        obs_dict["territory_owner"] = relative_owners.astype(np.int8)
+
+        obs_dict["action_phase"] = np.array(obs_dict["action_phase"], dtype=np.int8)
+        obs_dict["troops_to_place"] = np.array(obs_dict["troops_to_place"], dtype=np.int16)
+        obs_dict["selected_node"] = np.array(obs_dict["selected_node"], dtype=np.int16)
+        self.observations[agent]["observation"]["selected_edge"] = np.array(obs_dict["selected_edge"], dtype=np.int16)
         if self.is_card_game:
-            self.observations[agent]["observation"]["cards_in_hand"] = self.world_state["cards_in_hand"][agent_idx]
+            obs_dict["cards_in_hand"] = self.world_state["cards_in_hand"][agent_idx]
             hand_counts = np.sum(self.world_state["cards_in_hand"], axis=1).astype(np.int16)
             hand_counts = np.delete(hand_counts, agent_idx)
-            self.observations[agent]["observation"]["amount_cards_others"] = hand_counts
+            obs_dict["amount_cards_others"] = hand_counts
 
         self.observations[agent]["action_mask"] = self.risk_helper.generate_action_mask(
             agent_state=self.world_state,
