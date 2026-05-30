@@ -8,7 +8,7 @@ dependencies = [
     "pettingzoo~=1.26.0",
     "numpy~=2.2.6",
     "torch~=2.12.0",
-    "tianshou @ git+https://github.com/thu-ml/tianshou.git@master#egg=tianshou",
+    "tianshou[eval]",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +20,7 @@ rocm = [
 [tool.uv.sources]
 torch = { index = "rocm-index" }
 triton-rocm = { index = "rocm-index" }
+tianshou = { git = "https://github.com/thu-ml/tianshou.git", branch = "master" }
 
 [[tool.uv.index]]
 name = "rocm-index"
@@ -28,6 +29,9 @@ explicit = true
 
 [tool.uv]
 environments = ["sys_platform == 'linux'"]
+
+[tool.setuptools]
+packages = ["agents", "environment"]
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
