@@ -154,3 +154,5 @@ Makefile
 .continue
 .playwright-mcp
 .vscode
+
+log/
