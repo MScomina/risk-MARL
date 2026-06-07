@@ -17,7 +17,7 @@ from gymnasium.spaces import Box, Dict, Discrete, Space
 # State/observation spaces info:
 #   territory_owner: The owner of the territory, -1 if owned by nobody.
 #   number_of_armies: Number of armies in a territory.
-#   action_phase: Number representing the phase (0: initial placing, 1: select army count, 2: select node, 3: select edge)
+#   action_phase: Number representing the phase (0: initial placing, 1: select army count, 2: select node, 3: select edge, 4: trade cards)
 #   troops_to_place: How many reinforcement troops are left to place (if reinforcement phase).
 #   selected_node: Node ID selected in a previous select_node move, -1 if not selected.
 #   selected_edge: Edge ID selected in a previous select_edge move, -1 if not selected.
@@ -27,6 +27,7 @@ from gymnasium.spaces import Box, Dict, Discrete, Space
 #   - Node ID to pick (if phase 0 or 2, usually meant for reinforcements) + 1 (No-op case)
 #   - Edge ID to pick (if phase 3, usually meant for movement/attack) + 1 (No-op case)
 #   - Number of armies to use (if phase 1, usually after a node/edge pick move)
+#   - Card trade combination (if phase 4, usually at the start of the turn)
 
 class CardTypes(IntEnum):
     INFANTRY = 0
@@ -122,6 +123,18 @@ class RiskHelper():
         CardTypes.JOKER: 2
     }
 
+    _CARD_TYPES = np.array(
+        list(_CARD_DRAW_WEIGHTS.keys()),
+        dtype=np.int8
+    )
+
+    _CARD_PROBS = np.array(
+        list(_CARD_DRAW_WEIGHTS.values()),
+        dtype=np.float32
+    )
+
+    _CARD_PROBS /= _CARD_PROBS.sum()
+
     def __init__(self, game_map : nx.DiGraph, num_agents : int, max_armies : int, is_card_game : bool):
 
         self.game_map = game_map
@@ -133,6 +146,13 @@ class RiskHelper():
         self.mask_size = max(self.num_nodes + 1, self.num_edges + 1, self.max_armies, len(TradeChoices))
 
         self.is_card_game = is_card_game
+
+        self.edge_src = np.empty(self.num_edges, dtype=np.int16)
+        self.edge_dst = np.empty(self.num_edges, dtype=np.int16)
+
+        for idx, (src, dst) in self.game_map.graph["idx_to_edge"].items():
+            self.edge_src[idx] = self.game_map.graph["node_to_idx"][src]
+            self.edge_dst[idx] = self.game_map.graph["node_to_idx"][dst]
 
     def observation_space(self) -> Dict:
 
@@ -235,34 +255,37 @@ class RiskHelper():
         can_expand = (state["number_of_armies"] < self.max_armies)
         valid_nodes = owned & can_expand
         
-        valid_indices = np.where(valid_nodes)[0]
-        mask[valid_indices] = 1
+        mask[:-1] = valid_nodes
 
-        if len(valid_indices) == 0:
-            # No node possible, either the agent is dead or no more troops can be placed. No-op.
+        if not valid_nodes.any():
             mask[-1] = 1
 
         return mask
 
-    def _mask_select_edge(self, state : dict, agent_id : int) -> np.ndarray:
+    def _mask_select_edge(self, state: dict, agent_id: int) -> np.ndarray:
 
-        mask = np.zeros(self.num_edges+1, dtype=np.int8)
-        owned_nodes = set(np.where(state["territory_owner"] == agent_id)[0])
-        has_movement = False
+        mask = np.zeros(self.num_edges + 1, dtype=np.int8)
 
-        for src_node in owned_nodes:
-            if state["number_of_armies"][src_node] <= 1:
-                # Source node only has one army, can't move or attack.
-                continue
-            for edge in self.game_map.out_edges(self.game_map.graph["idx_to_node"][src_node]):
-                dst_node = self.game_map.graph["node_to_idx"][edge[1]]
-                if not has_movement and (dst_node in owned_nodes and not state["number_of_armies"][dst_node] >= self.max_armies):
-                    has_movement = True
-                if not (dst_node in owned_nodes and state["number_of_armies"][dst_node] >= self.max_armies):
-                    mask[self.game_map.graph["edge_to_idx"][edge]] = 1
+        owners = state["territory_owner"]
+        armies = state["number_of_armies"]
+
+        src_owned = owners[self.edge_src] == agent_id
+        src_can_act = armies[self.edge_src] > 1
+
+        valid_src = src_owned & src_can_act
+
+        dst_owned = owners[self.edge_dst] == agent_id
+        dst_full = armies[self.edge_dst] >= self.max_armies
+
+        mask[:-1] = valid_src & ~(dst_owned & dst_full)
+
+        has_movement = np.any(
+            valid_src &
+            dst_owned &
+            ~dst_full
+        )
 
         if not has_movement:
-            # No movement action found, must allow No-op/pass turn action.
             mask[-1] = 1
 
         return mask
@@ -270,7 +293,7 @@ class RiskHelper():
     def _mask_select_army_count(self, state : dict, agent_id : int) -> np.ndarray:
 
         mask = np.zeros(self.max_armies, dtype=np.int8)
-        owned_nodes = set(np.where(state["territory_owner"] == agent_id)[0].tolist())
+        owners = state["territory_owner"]
 
         if state["troops_to_place"] > 0:
             # Still has reinforcement troops to place. Assuming a node has already been picked.
@@ -286,7 +309,7 @@ class RiskHelper():
             source_node_armies = state["number_of_armies"][self.game_map.graph["node_to_idx"][edge[0]]]
             dst = self.game_map.graph["node_to_idx"][self.game_map.graph["idx_to_edge"][state["selected_edge"]][1]]
             dst_node_armies = state["number_of_armies"][dst]
-            if self.game_map.graph["node_to_idx"][self.game_map.graph["idx_to_edge"][state["selected_edge"]][1]] in owned_nodes:
+            if owners[dst] == agent_id:
                 # This is a movement action.
                 mask[1:min(source_node_armies, self.max_armies-dst_node_armies+1)] = 1
             else:
@@ -327,17 +350,21 @@ class RiskHelper():
         return RiskHelper._TRADE_AMOUNTS[trade_type]
 
     @staticmethod
-    def draw_card(rng : np.random.Generator = np.random.default_rng()) -> int:
+    def draw_card(rng : np.random.Generator | None = None) -> int:
+        if rng is None:
+            rng = np.random.default_rng()
         # If one wants to develop an actual drawing setup with a deck, this function is to change.
         # For simplicity, it has just been reduced to drawing from a RNG generator.
-        card_types = list(RiskHelper._CARD_DRAW_WEIGHTS.keys())
-        weights = list(RiskHelper._CARD_DRAW_WEIGHTS.values())
-        probs = [w / sum(weights) for w in weights]
-        return rng.choice(card_types, p=probs)
+        return rng.choice(
+            RiskHelper._CARD_TYPES,
+            p=RiskHelper._CARD_PROBS
+        )
 
 
     @staticmethod
-    def risk_attack_outcome(atk_armies : int, def_armies : int, rng: np.random.Generator = np.random.default_rng()) -> tuple[int, int]:
+    def risk_attack_outcome(atk_armies : int, def_armies : int, rng: np.random.Generator | None = None) -> tuple[int, int]:
+        if rng is None:
+            rng = np.random.default_rng()
         # Given a number of attackers and defenders, returns the number of losses on both sides.
         atk_dice = min(3, atk_armies)
         def_dice = min(2, def_armies)
