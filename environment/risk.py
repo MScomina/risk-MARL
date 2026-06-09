@@ -429,8 +429,8 @@ class raw_env(AECEnv, EzPickle):
     def _compute_reinforcements(self, agent : str) -> int:
 
         if self.is_first_turn:
-            if self.n_agents in _STARTING_REINFORCEMENTS:
-                return _STARTING_REINFORCEMENTS[self.n_agents]
+            if self.n_agents in self._STARTING_REINFORCEMENTS:
+                return self._STARTING_REINFORCEMENTS[self.n_agents]
             return 120//self.n_agents
 
         troops_owned_territories = self.territory_counts[self.current_agent_idx]
