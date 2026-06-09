@@ -2,9 +2,9 @@
 	"name": "Risk: North America",
 	"description": "Risk's North America continent.",
     "source": "https://en.wikipedia.org/wiki/Risk_(game)#/media/File:Risk_game_graph.svg",
-	"continents": [
-		{
-			"name": "north_america",
+	"continents": {
+		"north_america" : {
+			"name": "North America",
 			"bonus": 5,
 			"territories": [
 				"alaska",
@@ -18,7 +18,7 @@
 				"western_united_states"
 			]
 		}
-	],
+	},
 	"territories": {
 		"alaska": {
 			"name": "Alaska",

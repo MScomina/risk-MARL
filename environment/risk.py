@@ -17,7 +17,7 @@ from .maps import graph_utils
 from .risk_utils import CardTypes, FlattenObservationWrapper, RiskPhase, RiskHelper, TradeChoices
 
 # Environment definitions:
-#   (Underlying) Space states:  
+#   (Underlying) Space states:
 #       - Ownership of territories (part of observation)
 #       - Amount of armies in each territory (part of observation)
 #       - Action phase (0: initial placing, 1: select army count, 2: select node, 3: select edge, 4: select card trade)
@@ -33,6 +33,7 @@ NUM_AGENTS = 2
 MAX_ARMIES = 100
 MAX_ITERS = 10_000
 IS_CARD_GAME = True
+DENSE_REWARDS = True
 
 def env(should_flatten_obs : bool = False, **kwargs) -> AECEnv:
     env = raw_env(**kwargs)
@@ -48,8 +49,17 @@ class raw_env(AECEnv, EzPickle):
 
     metadata : dict = {"render_modes": ["human"], "name": "risk-v1"}
 
-    def __init__(self, render_mode=None, n_agents : int = NUM_AGENTS, map_path : Path | None = None, 
-                 max_armies : int = MAX_ARMIES, max_iters : int = MAX_ITERS, is_card_game : bool = IS_CARD_GAME):
+    _STARTING_REINFORCEMENTS = {
+        2: 40,
+        3: 35,
+        4: 30,
+        5: 25,
+        6: 20
+    }
+
+    def __init__(self, render_mode=None, n_agents : int = NUM_AGENTS, map_path : Path | None = None,
+                 max_armies : int = MAX_ARMIES, max_iters : int = MAX_ITERS, is_card_game : bool = IS_CARD_GAME,
+                 dense_rewards : bool = DENSE_REWARDS):
 
         EzPickle.__init__(self, render_mode, n_agents, map_path, max_armies, max_iters, is_card_game)
         super().__init__()
@@ -64,6 +74,7 @@ class raw_env(AECEnv, EzPickle):
         self.num_nodes = self.map_network.number_of_nodes()
         self.num_edges = self.map_network.number_of_edges()
         self.log_max_troops = np.log1p(self.max_armies * self.num_nodes)
+        self.dense_rewards = dense_rewards
 
         self.risk_helper = RiskHelper(
             game_map=self.map_network,
@@ -71,7 +82,7 @@ class raw_env(AECEnv, EzPickle):
             max_armies=self.max_armies,
             is_card_game=self.is_card_game
         )
-        
+
         self._observation_spaces = {
             agent: Dict(
                 {
@@ -94,6 +105,24 @@ class raw_env(AECEnv, EzPickle):
             (self.continent_masks[name], data["bonus"])
             for name, data in self.map_network.graph["continents"].items()
         ]
+
+        self._continent_lookup = {}
+
+        for mask, _ in self.continent_data:
+            n = np.count_nonzero(mask)
+
+            if n not in self._continent_lookup:
+                p = np.arange(n + 1) / n
+                self._continent_lookup[n] = (
+                    np.exp(6.0 * p) - 1
+                ) / (
+                    np.exp(6.0) - 1
+                )
+
+        self._continent_strength_buffer = np.zeros(
+            self.n_agents,
+            dtype=np.float32
+        )
 
         self.rewards = {agent: 0 for agent in self.agents}
         self._cumulative_rewards = {agent: 0 for agent in self.agents}
@@ -151,6 +180,7 @@ class raw_env(AECEnv, EzPickle):
         self.num_moves = 0
 
         self.has_conquered_this_turn = False
+        self.is_first_turn = True
 
         self._agent_selector.reinit(self.agents)
         self.agent_selection = self._agent_selector.reset()
@@ -223,7 +253,8 @@ class raw_env(AECEnv, EzPickle):
         self._clear_rewards()
 
         should_end_turn = self._update_state(current_agent, action)
-        self._update_strength()
+        if self.dense_rewards:
+            self._update_strength()
 
         if self.territory_counts[self.current_agent_idx] == self.num_nodes:
             for agent in self.agents:
@@ -238,13 +269,13 @@ class raw_env(AECEnv, EzPickle):
                 if all(self.terminations[a] or self.truncations[a] for a in self.agents):
                     break
                 next_agent = self._agent_selector.next()
-                
+
             self.agent_selection = next_agent
             self.current_agent_idx = self.agent_to_idx[self.agent_selection]
             if not self.world_state["action_phase"] == RiskPhase.STARTING_PLACEMENT:
                 self.world_state["troops_to_place"] = self._compute_reinforcements(self.agent_selection)
             self.has_conquered_this_turn = False
-        
+
         self.num_moves += 1
         if self.num_moves >= self.max_iters:
             for agent in self.agents:
@@ -283,7 +314,7 @@ class raw_env(AECEnv, EzPickle):
                 self.world_state["selected_node"] = action
                 self.world_state["action_phase"] = RiskPhase.SELECT_ARMY_COUNT
                 return False
-            
+
             case RiskPhase.SELECT_EDGE:
                 if action == self.num_edges:
                     # No-op operation (no actions available, must pass turn)
@@ -312,15 +343,22 @@ class raw_env(AECEnv, EzPickle):
                     self.world_state["number_of_armies"][self.world_state["selected_node"]] += action
                     self.troop_counts[self.current_agent_idx] += action
                     self.world_state["troops_to_place"] -= action
-                    if self.world_state["troops_to_place"] > 0:
+                    if self.world_state["troops_to_place"] > 0 or self.is_first_turn:
                         self.world_state["action_phase"] = RiskPhase.SELECT_NODE
+                        if self.world_state["troops_to_place"] == 0:
+                            if self._agent_selector.is_last():
+                                # Done all the players' first turns, time to start the actual normal reinforcements
+                                self.is_first_turn = False
+                            # Still in starting reinforcement, switching to another player.
+                            self.world_state["selected_node"] = -1
+                            return True
                     else:
                         self.world_state["action_phase"] = RiskPhase.SELECT_EDGE
                     self.world_state["selected_node"] = -1
                     return False
 
                 elif self.world_state["selected_edge"] != -1:
-                    
+
                     edge = self.map_network.graph["idx_to_edge"][self.world_state["selected_edge"]]
                     src_node = self.map_network.graph["node_to_idx"][self.map_network.graph["idx_to_edge"][self.world_state["selected_edge"]][0]]
                     dst_node = self.map_network.graph["node_to_idx"][self.map_network.graph["idx_to_edge"][self.world_state["selected_edge"]][1]]
@@ -356,12 +394,14 @@ class raw_env(AECEnv, EzPickle):
                                 if self.is_card_game:
                                     self.world_state["cards_in_hand"][self.current_agent_idx] += self.world_state["cards_in_hand"][previous_owner]
                                     self.world_state["cards_in_hand"][previous_owner] = np.zeros(len(CardTypes), dtype=np.int16)
-                                self.rewards[agent] += 0.9 / self.num_agents    # Wiping opponent is good
+                                if self.dense_rewards:
+                                    self.rewards[agent] += 0.1 / (self.num_agents-1)    # Wiping opponent is good
+                                    self.rewards[self.agents[previous_owner]] -= 1.0 # Dying is bad
 
                         self.world_state["action_phase"] = RiskPhase.SELECT_EDGE
                         self.world_state["selected_edge"] = -1
                         return False
-                    
+
                     else:
                         # Moving.
                         if action == 0 or action >= self.world_state["number_of_armies"][src_node]:
@@ -380,13 +420,18 @@ class raw_env(AECEnv, EzPickle):
                 self._update_cards(action=action)
                 self.world_state["action_phase"] = RiskPhase.SELECT_NODE
                 return False
-                
+
             case _:
                 raise ValueError(f"Undefined phase condition: {self.world_state['action_phase']}")
 
         return False
-    
+
     def _compute_reinforcements(self, agent : str) -> int:
+
+        if self.is_first_turn:
+            if self.n_agents in _STARTING_REINFORCEMENTS:
+                return _STARTING_REINFORCEMENTS[self.n_agents]
+            return 120//self.n_agents
 
         troops_owned_territories = self.territory_counts[self.current_agent_idx]
         territory_armies = max(3, troops_owned_territories//3)
@@ -395,7 +440,7 @@ class raw_env(AECEnv, EzPickle):
         for mask, bonus in self.continent_data:
             if np.all(self.world_state["territory_owner"][mask] == self.current_agent_idx):
                 continents_armies += bonus
-    
+
         total_amount = territory_armies + continents_armies
         return total_amount
 
@@ -424,49 +469,66 @@ class raw_env(AECEnv, EzPickle):
                         break
             case _:
                 raise ValueError(f"Undefined trade choice: {action}")
-                
+
         return
-        
+
     def _update_strength(self):
 
-        if self.world_state["action_phase"] == RiskPhase.STARTING_PLACEMENT:
+        if self.world_state["action_phase"] == RiskPhase.STARTING_PLACEMENT or self.is_first_turn:
             return np.zeros(self.n_agents, dtype=np.float32)
+
+        territory_coeff = 1.0
+        troops_coeff = 0.5
+        continent_coeff = 1.0
 
         territory_owner = self.world_state["territory_owner"]
         armies = self.world_state["number_of_armies"]
 
-        strength = self.territory_counts / self.num_nodes
+        territory_strength = territory_coeff * self.territory_counts / self.num_nodes
 
-        strength += 0.5 * np.log1p(self.troop_counts) / self.log_max_troops
+        troops_strength = troops_coeff * np.log1p(self.troop_counts) / self.log_max_troops
 
+        continent_strength = np.zeros(self.n_agents, dtype=np.float32)
 
-        continent_bonus = np.zeros(self.n_agents, dtype=np.float32)
+        continent_spiky = 6.0
+
+        continent_exp_denom = np.exp(continent_spiky) - 1
 
         for mask, bonus in self.continent_data:
 
             owners = territory_owner[mask]
-            owner0 = owners[0]
 
-            if owner0 != -1 and np.all(owners == owner0):
-                continent_bonus[owner0] += bonus
+            counts = np.bincount(
+                owners[owners >= 0],
+                minlength=self.n_agents
+            )
 
-        strength += 0.5 * continent_bonus / self.max_continent_bonus
+            continent_strength += (
+                bonus
+                * self._continent_lookup[np.count_nonzero(mask)][counts]
+            )
 
+        continent_strength = continent_coeff * continent_strength / self.max_continent_bonus
 
-        global_mean = strength.mean()
-        relative_strength = strength - global_mean
+        strength = territory_strength + troops_strength + continent_strength
 
-        delta = relative_strength - self.strength
+        total_strength = np.sum(strength)
 
-        reward_scale = 0.1
-        rewards = reward_scale * delta
+        relative_strength = (
+            strength
+            - (total_strength - strength) / (self.n_agents - 1)
+        )
+
+        max_possible_strength = territory_coeff + troops_coeff + continent_coeff
+
+        reward_scale_strength = 0.5
+        rewards = reward_scale_strength * (
+            relative_strength - self.strength
+        ) / max_possible_strength
 
         agents = self.agents
-        rewards_dict = self.rewards
 
         for i in range(self.n_agents):
-            rewards_dict[agents[i]] += rewards[i]
+            self.rewards[agents[i]] += float(rewards[i])
 
         self.strength[:] = relative_strength
-
-        return relative_strength
