@@ -24,28 +24,26 @@ class MARLRandomDiscreteMaskedOnPolicyAdapter(MARLRandomDiscreteMaskedOffPolicyA
 
 class Args:
     seed = 1626
-    eps_test = 0.0
-    eps_train = 0.8
     buffer_size = 1e5
-    lr = 3e-4
-    gamma = 0.999
+    lr = 1e-4
+    gamma = 0.995
     gae_lambda = 0.97
     vf_coef = 0.5
-    ent_coef = 0.01
+    ent_coef = 5e-3
     dual_clip: float | None = None
     value_clip: bool = True
     advantage_normalization: bool = True
     recompute_advantage: bool = True
     n_step = 512
     target_update_freq = 256
-    epoch = 500
-    epoch_start_step = 64
-    epoch_max_steps = 4096
+    epoch = 1000
+    epoch_start_step = 256
+    epoch_max_steps = 16384
     collection_step_num_env_steps = 1024
     update_per_step = 1.0
     batch_size = 256
     num_train_envs = 16
-    num_test_envs = 8
+    num_test_envs = 5
     max_grad_norm = 0.3
     eps_clip = 0.2
     logdir = "log"
@@ -53,11 +51,9 @@ class Args:
     win_rate = 0.9
     watch = False
     agent_id = 1
-    resume_path = ""  # Path to pre-trained agent .pth file
-    opponent_path = ""  # Path to pre-trained opponent .pth file
-    device = "cpu"
-    load_model = False
-    model_save_path = None  # Will be set in save_best_fn
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    load_model = True
+    model_save_path = None
 
 args = Args()
 
@@ -76,11 +72,11 @@ def main():
 
     env_params = [
         {
-            "max_iters": min(args.epoch_start_step * (2**(env_length//2)), args.epoch_max_steps),
-            "n_agents": 3,
-            "map_path": "./environment/maps/africa-europe.json",
+            "max_iters": min(args.epoch_start_step * (2**(env_length)), args.epoch_max_steps),
+            "n_agents": 4,
+            "map_path": "./environment/maps/classic.json",
             "is_card_game": True,
-            "max_armies": 50
+            "max_armies": 100
         } for env_length in range(args.num_train_envs)
     ]
 
@@ -89,7 +85,7 @@ def main():
     ])
     
     test_envs = ts.env.SubprocVectorEnv([
-        (lambda: get_env(env_params[-1])) for _ in range(args.num_test_envs)
+        (lambda config=env_params[-1]: get_env(config)) for _ in range(args.num_test_envs)
     ])
 
     np.random.seed(args.seed)
@@ -121,19 +117,14 @@ def main():
         action_space=1,
         map_graph=env.env.map_network,
         res_hidden_size=128,
-        gnn_hidden_size=16,
-        residual_depth=1,
+        gnn_hidden_size=64,
+        residual_depth=2,
         embed_space_owners=8,
         embed_space_phase=8,
         activation_function=torch.nn.SiLU,
         starting_residual_scale=0.2,
-        n_heads=2
+        n_heads=4
     ).to(args.device)
-
-    full_path = os.path.join(args.logdir, "ppo")
-    if args.load_model:
-        net_actor.load_state_dict(torch.load(os.path.join(full_path, "actor.pth")))
-        net_critic.load_state_dict(torch.load(os.path.join(full_path, "critic.pth")))
 
     policy = DiscreteActorPolicy(
         actor=net_actor,
@@ -156,6 +147,11 @@ def main():
         eps_clip=args.eps_clip
     ).to(args.device)
 
+    full_path = os.path.join(args.logdir, "ppo")
+    if args.load_model:
+        algorithm.load_state_dict(torch.load(os.path.join(full_path, "actor.pth")))
+        net_critic.load_state_dict(torch.load(os.path.join(full_path, "critic.pth")))
+
     agents = [algorithm] + [
         MARLRandomDiscreteMaskedOnPolicyAdapter(action_space=action_space)
         for _ in range(env.num_agents - 1)
@@ -169,7 +165,7 @@ def main():
         VectorReplayBuffer(args.buffer_size, len(train_envs)),
         exploration_noise=True,
     )
-    test_collector = Collector[CollectStats](marl_algorithm, test_envs, exploration_noise=True)
+    test_collector = Collector[CollectStats](marl_algorithm, test_envs, exploration_noise=False)
 
     training_collector.reset()
     training_collector.collect(n_step=args.batch_size * args.num_train_envs)
@@ -185,7 +181,7 @@ def main():
             model_save_path = args.model_save_path
         else:
             model_save_path = os.path.join(args.logdir, "ppo")
-        torch.save(policy.state_dict(), os.path.join(model_save_path, "actor.pth"))
+        torch.save(policy.get_algorithm(target_agent_name).state_dict(), os.path.join(model_save_path, "actor.pth"))
         torch.save(net_critic.state_dict(), os.path.join(model_save_path, "critic.pth"))
 
     log_path = os.path.join(args.logdir, 'ppo')
@@ -194,9 +190,16 @@ def main():
 
     def train_fn(epoch: int, env_step: int) -> None:
         for name, param in net_actor.named_parameters():
-            writer.add_histogram(f"params/{name}", param.clone().detach().cpu(), global_step=env_step)
+            writer.add_histogram(f"params_act/{name}", param.clone().detach().cpu(), global_step=env_step)
             if param.grad is not None:
-                writer.add_histogram(f"grads/{name}", param.grad.clone().detach().cpu(), global_step=env_step)
+                writer.add_histogram(f"grads_act/{name}", param.grad.clone().detach().cpu(), global_step=env_step)
+        for name, param in net_critic.named_parameters():
+            writer.add_histogram(f"params_crit/{name}", param.clone().detach().cpu(), global_step=env_step)
+            if param.grad is not None:
+                writer.add_histogram(f"grads_crit/{name}", param.grad.clone().detach().cpu(), global_step=env_step)
+
+        new_ent = args.ent_coef - (args.ent_coef - 0.001) * min(1.0, epoch / (args.epoch))
+        algorithm.ent_coef
 
     result = marl_algorithm.run_training(
         OnPolicyTrainerParams(

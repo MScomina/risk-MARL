@@ -10,30 +10,7 @@ from environment.risk_utils import RiskPhase
 from tianshou.data.batch import Batch
 from tianshou.algorithm.algorithm_base import Policy
 from torch_geometric.data import Data
-from torch_geometric.nn import GATv2Conv, SAGEConv, Sequential as PyGSequential
-
-def shape_obs(obs_space : spaces.Dict, is_embedded : bool, use_one_hot : bool = False, n_nodes : int | None = None, n_edges : int | None = None,
-              embed_space_owners : int | None = None, embed_space_nodes : int | None = None, embed_space_edges : int | None = None, n_owners : int | None = None) -> int:
-
-    input_size = 0
-    # Embedding encoding for ownership of territories.
-    input_size += obs_space["territory_owner"].shape[0] * ((embed_space_owners if is_embedded else 1) if not use_one_hot else n_owners)
-    input_size += obs_space["number_of_armies"].shape[0]
-    # One hot encoding for action phases.
-    input_size += len(RiskPhase)
-    # Troops to place
-    input_size += 1
-    input_size += ((embed_space_nodes if is_embedded else 1) if not use_one_hot else n_nodes)
-    input_size += ((embed_space_edges if is_embedded else 1) if not use_one_hot else n_edges)
-
-    if "cards_in_hand" in obs_space.keys():
-        # Types of cards
-        input_size += obs_space["cards_in_hand"].shape[0]
-        # Amount cards opponent
-        input_size += obs_space["amount_cards_others"].shape[0]
-
-
-    return input_size
+from torch_geometric.nn import GATv2Conv, TransformerConv, Sequential as PyGSequential
 
 class PureLayerNorm(nn.Module):
 
@@ -78,7 +55,7 @@ class ResidualBlock(nn.Module):
             return x + self.residual_scale * self.block(x_norm)
         else:
             return self.block(x_norm)
-
+    
 class GraphNetwork(nn.Module):
 
     def __init__(self, 
@@ -122,8 +99,9 @@ class GraphNetwork(nn.Module):
         self.residual_depth = residual_depth
         self.starting_residual_scale = starting_residual_scale
         self.n_heads = n_heads
+        self.is_likely_critic = (self.output_shape == 1)
 
-        f_in = 1 + 1 + 1 + self.embed_space_owners + self.embed_space_phase    # n_armies, selected_node, selected_edge, territory_owner, phase info
+        f_in = 1  + self.embed_space_owners + self.embed_space_phase + (0 if self.is_likely_critic else 1+1)    # n_armies, selected_node, selected_edge, territory_owner, phase info
 
         self.owner_embedder = nn.Embedding(
             num_embeddings=(obs_space["territory_owner"].high[0] - obs_space["territory_owner"].low[0]+1),
@@ -135,16 +113,20 @@ class GraphNetwork(nn.Module):
             embedding_dim=self.embed_space_phase
         )
 
-        self.gnn = PyGSequential('x, edge_index', [
-            (GATv2Conv(f_in, self.gnn_hidden_size, heads=self.n_heads, concat=False, dropout=0.1), 'x, edge_index -> x'),
+        self.gnn = PyGSequential('x, edge_index, edge_attr', [
+            (TransformerConv(f_in, self.gnn_hidden_size, heads=self.n_heads, concat=True, dropout=0.1, edge_dim=4), 'x, edge_index, edge_attr -> x'),
+            nn.Linear(self.n_heads*self.gnn_hidden_size, self.gnn_hidden_size),
             PureLayerNorm(self.gnn_hidden_size),
             self.activation_function(),
-            (GATv2Conv(self.gnn_hidden_size, self.gnn_hidden_size, heads=self.n_heads//2, concat=False, dropout=0.1), 'x, edge_index -> x'),
+            
+            (TransformerConv(self.gnn_hidden_size, self.gnn_hidden_size, heads=self.n_heads, concat=True, dropout=0.1, edge_dim=4), 'x, edge_index, edge_attr -> x'),
+            nn.Linear(self.n_heads*self.gnn_hidden_size, self.gnn_hidden_size),
             PureLayerNorm(self.gnn_hidden_size),
             self.activation_function()
         ])
 
-        self.pool = torchg.nn.global_mean_pool
+        self.mean_pool = torchg.nn.global_mean_pool
+        self.max_pool = torchg.nn.global_max_pool
 
         self.residual_block = nn.Sequential(
             *[ResidualBlock(
@@ -154,7 +136,7 @@ class GraphNetwork(nn.Module):
             ) for _ in range(self.residual_depth)]
         )
 
-        projection_size = self.gnn_hidden_size + self.embed_space_phase + 1
+        projection_size = (2*self.gnn_hidden_size) + self.embed_space_phase + 1 # mean+max pool, embed phase and reinforcements
 
         if "cards_in_hand" in obs_space.keys():
             projection_size += obs_space["cards_in_hand"].shape[0] + obs_space["amount_cards_others"].shape[0]
@@ -176,6 +158,7 @@ class GraphNetwork(nn.Module):
         else:
             obs_dict = obs
 
+        # Basic initialization
         territory_owner = torch.as_tensor(obs_dict["territory_owner"], dtype=torch.long, device=device)
         selected_node = torch.as_tensor(obs_dict["selected_node"], dtype=torch.long, device=device)
         selected_edge = torch.as_tensor(obs_dict["selected_edge"], dtype=torch.long, device=device)
@@ -191,45 +174,72 @@ class GraphNetwork(nn.Module):
         normalized_armies = torch.log1p(armies_tensor) / self.max_log_armies
         normalized_armies = normalized_armies.unsqueeze(2)
 
-        node_select_onehot = torch.zeros(batch_size, self.n_nodes, device=device)
-        valid_nodes = selected_node >= 0
-        node_select_onehot[valid_nodes, selected_node[valid_nodes]] = 1.0
-        node_select_onehot = node_select_onehot.unsqueeze(2)
+        if not self.is_likely_critic:
+            node_select_onehot = torch.zeros(batch_size, self.n_nodes, device=device)
+            valid_nodes = selected_node >= 0
+            node_select_onehot[valid_nodes, selected_node[valid_nodes]] = 1.0
+            node_select_onehot = node_select_onehot.unsqueeze(2)
 
-        edge_node_indicator = torch.zeros(batch_size, self.n_nodes, device=device)
-        valid_edges = selected_edge >= 0
+            edge_node_indicator = torch.zeros(batch_size, self.n_nodes, device=device)
+            valid_edges = selected_edge >= 0
 
-        if valid_edges.any():
-            active_edges = selected_edge[valid_edges]
-            src_nodes = self.edge_index[0, active_edges]
-            tgt_nodes = self.edge_index[1, active_edges]
+            if valid_edges.any():
+                active_edges = selected_edge[valid_edges]
+                src_nodes = self.edge_index[0, active_edges]
+                tgt_nodes = self.edge_index[1, active_edges]
 
-            batch_indices = torch.arange(batch_size, device=device)[valid_edges]
-            edge_node_indicator[batch_indices, src_nodes] = -1.0
-            edge_node_indicator[batch_indices, tgt_nodes] = 1.0
+                batch_indices = torch.arange(batch_size, device=device)[valid_edges]
+                edge_node_indicator[batch_indices, src_nodes] = -1.0
+                edge_node_indicator[batch_indices, tgt_nodes] = 1.0
 
-        edge_node_indicator = edge_node_indicator.unsqueeze(2)
-
+            edge_node_indicator = edge_node_indicator.unsqueeze(2)
 
         reinforce_tensor = torch.as_tensor(obs_dict["troops_to_place"], dtype=torch.float32, device=device)
         normalized_reinforcements = torch.log1p(reinforce_tensor).view(-1, 1) / self.max_log_armies
 
-        node_features = torch.cat([
+        features_array = [
             owner_embedding,
             normalized_armies,
-            node_select_onehot,
-            edge_node_indicator,
             phase_node_context
-        ], dim=2)
+        ]
+
+        if not self.is_likely_critic:
+            features_array.extend([node_select_onehot, edge_node_indicator])
+
+        # Computing node and edge features for GNN
+        node_features = torch.cat(features_array, dim=2)
+
+        node_armies = normalized_armies.squeeze(-1)
+        node_owners = territory_owner
+        edge_src, edge_dst = self.edge_index
+
+        batch_offsets = torch.arange(batch_size, device=device) * self.n_nodes
+
+        edge_src_b = edge_src.unsqueeze(0) + batch_offsets.unsqueeze(1)
+        edge_dst_b = edge_dst.unsqueeze(0) + batch_offsets.unsqueeze(1)
+
+        edge_src_b = edge_src_b.reshape(-1)
+        edge_dst_b = edge_dst_b.reshape(-1)
+
+        batched_edge_index = torch.stack([edge_src_b, edge_dst_b], dim=0)
+
+        flat_armies = node_armies.view(batch_size * self.n_nodes)
+        flat_owners = node_owners.view(batch_size * self.n_nodes)
+
+        edge_attr = torch.stack([
+            flat_armies[edge_src_b],
+            flat_armies[edge_dst_b],
+            flat_armies[edge_src_b] - flat_armies[edge_dst_b],
+            (flat_owners[edge_src_b] == flat_owners[edge_dst_b]).float()
+        ], dim=-1)
 
         x_flat = node_features.view(batch_size * self.n_nodes, -1)
-        offsets = torch.arange(batch_size, device=device).view(batch_size, 1, 1) * self.n_nodes
-        batched_edge_index = (self.edge_index.unsqueeze(0) + offsets).permute(1, 0, 2).reshape(2, -1)
 
-        h_nodes = self.gnn(x_flat, batched_edge_index)
+        h_nodes = self.gnn(x_flat, batched_edge_index, edge_attr)
 
         batch_idx = torch.arange(batch_size, device=device).repeat_interleave(self.n_nodes)
-        h_pooled = self.pool(h_nodes, batch_idx)
+        h_mean_pooled = self.mean_pool(h_nodes, batch_idx)
+        h_max_pooled = self.max_pool(h_nodes, batch_idx)
 
         if "cards_in_hand" in obs_dict:
             cards_normalized = torch.log1p(torch.as_tensor(obs_dict["cards_in_hand"], dtype=torch.float32, device=device))
@@ -239,7 +249,8 @@ class GraphNetwork(nn.Module):
             hands_normalized = torch.zeros((batch_size, 0), dtype=torch.float32, device=device)
 
         h_global = torch.cat([
-            h_pooled, 
+            h_mean_pooled,
+            h_max_pooled, 
             phase_emb,
             normalized_reinforcements,
             cards_normalized,
@@ -260,10 +271,10 @@ class GraphNetwork(nn.Module):
             mask = torch.as_tensor(obs["mask"], dtype=torch.bool, device=device)
             logits = torch.where(mask, logits, torch.tensor(-1e8, device=device))
 
-        if self.output_shape == 1:
-            return logits
+        if self.is_likely_critic:
+            return logits.cpu()
 
-        return logits, state
+        return logits.cpu(), state
 
 
     def _init_weights(self):
