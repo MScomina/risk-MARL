@@ -1,5 +1,6 @@
 # https://gymnasium.farama.org/api/env/
 # https://pettingzoo.farama.org/content/environment_creation/
+# https://arxiv.org/pdf/2402.07411 (Potential-Based Reward Shaping For Intrinsic Motivation)
 
 from copy import copy
 import functools
@@ -14,7 +15,14 @@ from pettingzoo.utils import AgentSelector, wrappers
 from pathlib import Path
 
 from .maps import graph_utils
-from .risk_utils import CardTypes, FlattenObservationWrapper, RiskPhase, RiskHelper, TradeChoices
+from .risk_utils import (
+    CardTypes, 
+    FlattenObservationWrapper, 
+    RiskPhase, 
+    RiskHelper, 
+    TradeChoices,
+    TroopActions
+)
 
 # Environment definitions:
 #   (Underlying) Space states:
@@ -30,10 +38,12 @@ from .risk_utils import CardTypes, FlattenObservationWrapper, RiskPhase, RiskHel
 #       - Type of card trade to perform
 
 NUM_AGENTS = 2
-MAX_ARMIES = 100
+MAX_ARMIES = 1_000
 MAX_ITERS = 10_000
 IS_CARD_GAME = True
 DENSE_REWARDS = True
+MAX_ATK_DEF_TROOPS = (3, 2)
+IS_BLITZ = True
 
 def env(should_flatten_obs : bool = False, **kwargs) -> AECEnv:
     env = raw_env(**kwargs)
@@ -59,7 +69,8 @@ class raw_env(AECEnv, EzPickle):
 
     def __init__(self, render_mode=None, n_agents : int = NUM_AGENTS, map_path : Path | None = None,
                  max_armies : int = MAX_ARMIES, max_iters : int = MAX_ITERS, is_card_game : bool = IS_CARD_GAME,
-                 dense_rewards : bool = DENSE_REWARDS):
+                 dense_rewards : bool = DENSE_REWARDS, max_atk_def_troops : tuple[int, int] = MAX_ATK_DEF_TROOPS,
+                 is_blitz : bool = IS_BLITZ, rng: np.random.Generator | None = None, gamma : float = 0.999):
 
         EzPickle.__init__(self, render_mode, n_agents, map_path, max_armies, max_iters, is_card_game)
         super().__init__()
@@ -75,12 +86,27 @@ class raw_env(AECEnv, EzPickle):
         self.num_edges = self.map_network.number_of_edges()
         self.log_max_troops = np.log1p(self.max_armies * self.num_nodes)
         self.dense_rewards = dense_rewards
+        if rng is None:
+            self.rng = np.random.default_rng()
+        else:
+            self.rng = rng
+
+        # The idea with is_blitz is that one can commit more troops and the environment will 
+        # automatically resolve the battle with that many troops over and over.
+        # False: Only singular attack instances are allowed
+        # True: agents can send any amount they have, the battles will go until armies on either end finish.
+        self.is_blitz = is_blitz
+        self.max_atk_def_troops = max_atk_def_troops
+        self.gamma = gamma
 
         self.risk_helper = RiskHelper(
             game_map=self.map_network,
             num_agents=self.n_agents,
             max_armies=self.max_armies,
-            is_card_game=self.is_card_game
+            is_card_game=self.is_card_game,
+            max_atk_def_troops=self.max_atk_def_troops,
+            is_blitz=self.is_blitz,
+            rng=self.rng
         )
 
         self._observation_spaces = {
@@ -97,16 +123,17 @@ class raw_env(AECEnv, EzPickle):
             }
         )
 
-        self.continent_masks = self.risk_helper._generate_continent_masks()
+        continent_masks = self.risk_helper._generate_continent_masks()
         self.max_continent_bonus = sum(
             c["bonus"] for c in self.map_network.graph["continents"].values()
         )
         self.continent_data = [
-            (self.continent_masks[name], data["bonus"])
+            (continent_masks[name], data["bonus"])
             for name, data in self.map_network.graph["continents"].items()
         ]
 
         self._continent_lookup = {}
+        self._continent_reward_spiky = 2.0
 
         for mask, _ in self.continent_data:
             n = np.count_nonzero(mask)
@@ -114,15 +141,10 @@ class raw_env(AECEnv, EzPickle):
             if n not in self._continent_lookup:
                 p = np.arange(n + 1) / n
                 self._continent_lookup[n] = (
-                    np.exp(6.0 * p) - 1
+                    np.exp(self._continent_reward_spiky * p) - 1
                 ) / (
-                    np.exp(6.0) - 1
+                    np.exp(self._continent_reward_spiky) - 1
                 )
-
-        self._continent_strength_buffer = np.zeros(
-            self.n_agents,
-            dtype=np.float32
-        )
 
         self.rewards = {agent: 0 for agent in self.agents}
         self._cumulative_rewards = {agent: 0 for agent in self.agents}
@@ -133,16 +155,18 @@ class raw_env(AECEnv, EzPickle):
         self._agent_selector = AgentSelector(self.agents)
         self.agent_selection = self._agent_selector.reset()
         self.current_agent_idx = 0
+        self.strength_dirty = True
+        self.has_received_starting_reinforcement = np.zeros(self.n_agents, dtype=bool)
 
         self.render_mode = render_mode
 
 
-    @functools.lru_cache(maxsize=1000000)
+    @functools.lru_cache(maxsize=1000)
     def observation_space(self, agent):
         return self._observation_spaces[agent]
 
 
-    @functools.lru_cache(maxsize=1000000)
+    @functools.lru_cache(maxsize=1000)
     def action_space(self, agent):
         return self._action_spaces[agent]
 
@@ -152,35 +176,16 @@ class raw_env(AECEnv, EzPickle):
         self.timestep = 0
 
         if seed is not None:
-            self.np_random, self.np_random_seed = seeding.np_random(seed)
+            self.rng = np.random.default_rng(seed)
+            self.risk_helper.rng = self.rng
 
         self.agents = copy(self.possible_agents)
         self.rewards = {agent: 0 for agent in self.agents}
         self._cumulative_rewards = {agent: 0 for agent in self.agents}
+        self._clear_rewards()
         self.terminations = {agent: False for agent in self.agents}
         self.truncations = {agent: False for agent in self.agents}
         self.infos = {agent: {} for agent in self.agents}
-
-        self.world_state = self.risk_helper.starting_observation(full_knowledge=True)
-
-        self.state = {
-            agent : self.world_state for agent in self.agents
-        }
-
-        self.observations = {
-            agent : {
-                "observation": self.world_state,
-                "action_mask": self.risk_helper.generate_action_mask(
-                    agent_state=self.world_state,
-                    agent_id=idx
-                )
-            } for idx, agent in enumerate(self.agents)
-        }
-
-        self.num_moves = 0
-
-        self.has_conquered_this_turn = False
-        self.is_first_turn = True
 
         self._agent_selector.reinit(self.agents)
         self.agent_selection = self._agent_selector.reset()
@@ -188,51 +193,29 @@ class raw_env(AECEnv, EzPickle):
             agent: i
             for i, agent in enumerate(self.agents)
         }
+
+        self.world_state = self.risk_helper.starting_observation(full_knowledge=True)
+    
+        self.observations = {
+            agent : self._compute_observation(agent) for agent in self.agents
+        }
+
+        self.num_moves = 0
+
+        self.has_conquered_this_turn = False
+        self.is_first_turn = True
+        self.has_received_starting_reinforcement[:] = False
+
         self.current_agent_idx = self.agent_to_idx[self.agent_selection]
-        self.strength = np.zeros(self.n_agents)
+        self.prev_phi = np.zeros(self.n_agents)
+        self.reward_ema = np.zeros(self.n_agents, dtype=np.float32)
         self.territory_counts = np.zeros(self.n_agents, dtype=np.int16)
         self.troop_counts = np.zeros(self.n_agents, dtype=np.int32)
+        self.strength_dirty = True
 
 
     def observe(self, agent: str):
-        agent_idx = self.agent_to_idx[agent]
-
-        ws = self.world_state
-
-        obs = {
-            "territory_owner": ws["territory_owner"].copy(),
-            "number_of_armies": ws["number_of_armies"],
-            "action_phase": np.array(ws["action_phase"], dtype=np.int8),
-            "troops_to_place": np.array(ws["troops_to_place"], dtype=np.int16),
-            "selected_node": np.array(ws["selected_node"], dtype=np.int16),
-            "selected_edge": np.array(ws["selected_edge"], dtype=np.int16),
-        }
-
-        owners = obs["territory_owner"]
-        obs["territory_owner"] = np.where(
-            owners >= 0,
-            (owners - agent_idx) % self.n_agents,
-            owners
-        ).astype(np.int8)
-
-        if self.is_card_game:
-            cards = ws["cards_in_hand"]
-
-            obs["cards_in_hand"] = cards[agent_idx].copy()
-
-            obs["amount_cards_others"] = np.sum(cards, axis=1).astype(np.int16)
-            obs["amount_cards_others"] = np.delete(obs["amount_cards_others"], agent_idx)
-
-        action_mask = self.risk_helper.generate_action_mask(
-            agent_state=ws,
-            agent_id=agent_idx
-        )
-
-        self.observations[agent] = {
-            "observation": obs,
-            "action_mask": action_mask
-        }
-
+        self.observations[agent] = self._compute_observation(agent)
         return self.observations[agent]
 
 
@@ -253,10 +236,11 @@ class raw_env(AECEnv, EzPickle):
         self._clear_rewards()
 
         should_end_turn = self._update_state(current_agent, action)
-        if self.dense_rewards:
+        if self.dense_rewards and self.strength_dirty:
             self._update_strength()
 
         if self.territory_counts[self.current_agent_idx] == self.num_nodes:
+            print(f"{current_agent} has won!")
             for agent in self.agents:
                 if agent == current_agent:
                     self.rewards[agent] = 1.0
@@ -273,12 +257,20 @@ class raw_env(AECEnv, EzPickle):
             self.agent_selection = next_agent
             self.current_agent_idx = self.agent_to_idx[self.agent_selection]
             if not self.world_state["action_phase"] == RiskPhase.STARTING_PLACEMENT:
-                self.world_state["troops_to_place"] = self._compute_reinforcements(self.agent_selection)
+                self.world_state["troops_to_place"] = self._compute_reinforcements()
             self.has_conquered_this_turn = False
 
         self.num_moves += 1
         if self.num_moves >= self.max_iters:
-            for agent in self.agents:
+            if self.strength_dirty:
+                self._update_strength()
+
+            final_strength = self.prev_phi.copy()
+
+            for i, agent in enumerate(self.agents):
+
+                self.rewards[agent] += 0.2 * float(final_strength[i])**2
+
                 self.truncations[agent] = True
 
         self._accumulate_rewards()
@@ -296,6 +288,7 @@ class raw_env(AECEnv, EzPickle):
                 self.world_state["number_of_armies"][action] = 1
                 self.territory_counts[self.current_agent_idx] += 1
                 self.troop_counts[self.current_agent_idx] += 1
+                self.strength_dirty = True
                 if np.all(self.world_state["territory_owner"] != -1):
                     # All nodes have been taken, reinforcement has begun.
                     self.world_state["action_phase"] = RiskPhase.SELECT_NODE
@@ -312,7 +305,7 @@ class raw_env(AECEnv, EzPickle):
                 if self.world_state["territory_owner"][action] != self.current_agent_idx:
                     raise RuntimeError(f"Agent {agent} tried to pick another player's territory for action: {action}")
                 self.world_state["selected_node"] = action
-                self.world_state["action_phase"] = RiskPhase.SELECT_ARMY_COUNT
+                self.world_state["action_phase"] = RiskPhase.TROOPS_REINFORCE
                 return False
 
             case RiskPhase.SELECT_EDGE:
@@ -326,94 +319,105 @@ class raw_env(AECEnv, EzPickle):
                     return True
                 if action > self.num_edges:
                     raise RuntimeError(f"Agent {agent} tried to pick an edge index greater than the number of edges: {action}")
-                edge = self.map_network.graph["idx_to_edge"][action]
-                src_node = self.map_network.graph["node_to_idx"][edge[0]]
+
+                edge_id = action
+                src_node = self.risk_helper.edge_src[edge_id]
+                dst_node = self.risk_helper.edge_dst[edge_id]
+
                 if self.world_state["territory_owner"][src_node] != self.current_agent_idx:
                     raise RuntimeError(f"Agent {agent} tried to pick an invalid edge ({src_node} is owned by {self.world_state['territory_owner'][src_node]}): {action}")
                 self.world_state["selected_edge"] = action
-                self.world_state["action_phase"] = RiskPhase.SELECT_ARMY_COUNT
+                if self.world_state["territory_owner"][dst_node] != self.current_agent_idx:
+                    self.world_state["action_phase"] = RiskPhase.TROOPS_ATTACK
+                else:
+                    self.world_state["action_phase"] = RiskPhase.TROOPS_MOVEMENT
                 return False
 
-            case RiskPhase.SELECT_ARMY_COUNT:
-
-                if self.world_state["selected_node"] != -1:
-                    # Reinforcing own territory
-                    if self.world_state["troops_to_place"] < action:
-                        raise RuntimeError(f"Agent {agent} tried to reinforce with more troops than available: {action}")
-                    self.world_state["number_of_armies"][self.world_state["selected_node"]] += action
-                    self.troop_counts[self.current_agent_idx] += action
-                    self.world_state["troops_to_place"] -= action
-                    if self.world_state["troops_to_place"] > 0 or self.is_first_turn:
-                        self.world_state["action_phase"] = RiskPhase.SELECT_NODE
-                        if self.world_state["troops_to_place"] == 0:
-                            if self._agent_selector.is_last():
-                                # Done all the players' first turns, time to start the actual normal reinforcements
-                                self.is_first_turn = False
-                            # Still in starting reinforcement, switching to another player.
-                            self.world_state["selected_node"] = -1
-                            return True
-                    else:
-                        self.world_state["action_phase"] = RiskPhase.SELECT_EDGE
+            case RiskPhase.TROOPS_REINFORCE:
+                # Reinforcing own territory
+                troop_storage = self.world_state["troops_to_place"]
+                troop_reinforce_amount = TroopActions[action].to_troops(troop_storage)
+                self.world_state["number_of_armies"][self.world_state["selected_node"]] += troop_reinforce_amount
+                self.troop_counts[self.current_agent_idx] += troop_reinforce_amount
+                self.world_state["troops_to_place"] -= troop_reinforce_amount
+                self.strength_dirty = True
+                if self.world_state["troops_to_place"] > 0:
+                    self.world_state["action_phase"] = RiskPhase.SELECT_NODE     
                     self.world_state["selected_node"] = -1
                     return False
-
-                elif self.world_state["selected_edge"] != -1:
-
-                    edge = self.map_network.graph["idx_to_edge"][self.world_state["selected_edge"]]
-                    src_node = self.map_network.graph["node_to_idx"][self.map_network.graph["idx_to_edge"][self.world_state["selected_edge"]][0]]
-                    dst_node = self.map_network.graph["node_to_idx"][self.map_network.graph["idx_to_edge"][self.world_state["selected_edge"]][1]]
-
-                    if self.world_state["territory_owner"][dst_node] != self.current_agent_idx:
-                        # Attacking.
-                        if action == 0 or action > min(3,self.world_state["number_of_armies"][src_node]-1):
-                            raise RuntimeError(f"Agent {agent} tried to attack with too many troops: {action}")
-
-                        previous_owner = self.world_state["territory_owner"][dst_node]
-
-                        dst_amount = self.world_state["number_of_armies"][dst_node]
-                        atk_losses, def_losses = self.risk_helper.risk_attack_outcome(action, dst_amount)
-
-                        self.world_state["number_of_armies"][src_node] -= atk_losses
-                        self.world_state["number_of_armies"][dst_node] -= def_losses
-
-                        self.troop_counts[self.current_agent_idx] -= atk_losses
-                        self.troop_counts[previous_owner] -= def_losses
-
-                        if self.world_state["number_of_armies"][dst_node] == 0:
-                            # No troops left, control switches.
-                            if not self.has_conquered_this_turn and self.is_card_game:
-                                self.world_state["cards_in_hand"][self.current_agent_idx][self.risk_helper.draw_card()] += 1
-                                self.has_conquered_this_turn = True
-                            self.territory_counts[self.current_agent_idx] += 1
-                            self.territory_counts[previous_owner] -= 1
-                            self.world_state["territory_owner"][dst_node] = self.current_agent_idx
-                            self.world_state["number_of_armies"][dst_node] += action - atk_losses
-                            self.world_state["number_of_armies"][src_node] -= action - atk_losses
-                            if self.territory_counts[previous_owner] <= 0:
-                                self.terminations[self.agents[previous_owner]] = True
-                                if self.is_card_game:
-                                    self.world_state["cards_in_hand"][self.current_agent_idx] += self.world_state["cards_in_hand"][previous_owner]
-                                    self.world_state["cards_in_hand"][previous_owner] = np.zeros(len(CardTypes), dtype=np.int16)
-                                if self.dense_rewards:
-                                    self.rewards[agent] += 0.1 / (self.num_agents-1)    # Wiping opponent is good
-                                    self.rewards[self.agents[previous_owner]] -= 1.0 # Dying is bad
-
-                        self.world_state["action_phase"] = RiskPhase.SELECT_EDGE
-                        self.world_state["selected_edge"] = -1
-                        return False
-
-                    else:
-                        # Moving.
-                        if action == 0 or action >= self.world_state["number_of_armies"][src_node]:
-                            raise RuntimeError(f"Agent {agent} tried to move with too many troops: {action}")
-                        self.world_state["number_of_armies"][src_node] -= action
-                        self.world_state["number_of_armies"][dst_node] += action
-                        if self.is_card_game:
-                            self.world_state["action_phase"] = RiskPhase.TRADE_CARDS
-                        else:
-                            self.world_state["action_phase"] = RiskPhase.SELECT_NODE
-                        self.world_state["selected_edge"] = -1
+                else:
+                    if self.is_first_turn:
+                        # Placed all starting troops, but others still have to place their starting ones.
+                        self.world_state["action_phase"] = RiskPhase.SELECT_NODE     
+                        self.world_state["selected_node"] = -1
                         return True
+                    self.world_state["action_phase"] = RiskPhase.SELECT_EDGE
+                self.world_state["selected_node"] = -1
+                return False
+
+            case RiskPhase.TROOPS_ATTACK:
+                # Attacking.
+                edge_id = self.world_state["selected_edge"]
+                src_node = self.risk_helper.edge_src[edge_id]
+                dst_node = self.risk_helper.edge_dst[edge_id]
+
+                max_troops = self.world_state["number_of_armies"][src_node]-1
+                if not self.is_blitz:
+                    max_troops = min(self.max_atk_def_troops[0],self.world_state["number_of_armies"][src_node]-1)
+
+                troop_attack_amount = TroopActions[action].to_troops(max_troops)
+                previous_owner = self.world_state["territory_owner"][dst_node]
+
+                dst_amount = self.world_state["number_of_armies"][dst_node]
+                atk_losses, def_losses, atk_last_amount = self.risk_helper.risk_attack_outcome(troop_attack_amount, dst_amount, max_atk_def_troops=self.max_atk_def_troops, rng=self.rng)
+
+                self.world_state["number_of_armies"][src_node] -= atk_losses
+                self.world_state["number_of_armies"][dst_node] -= def_losses
+
+                self.troop_counts[self.current_agent_idx] -= atk_losses
+                self.troop_counts[previous_owner] -= def_losses
+
+                if self.world_state["number_of_armies"][dst_node] == 0:
+                    # No troops left, control switches.
+                    if not self.has_conquered_this_turn and self.is_card_game:
+                        self.world_state["cards_in_hand"][self.current_agent_idx][self.risk_helper.draw_card(rng=self.rng)] += 1
+                        self.has_conquered_this_turn = True
+                    self.territory_counts[self.current_agent_idx] += 1
+                    self.territory_counts[previous_owner] -= 1
+                    self.world_state["territory_owner"][dst_node] = self.current_agent_idx
+                    self.world_state["number_of_armies"][dst_node] += atk_last_amount
+                    self.world_state["number_of_armies"][src_node] -= atk_last_amount
+                    if self.territory_counts[previous_owner] <= 0:
+                        self.terminations[self.agents[previous_owner]] = True
+                        if self.is_card_game:
+                            self.world_state["cards_in_hand"][self.current_agent_idx] += self.world_state["cards_in_hand"][previous_owner]
+                            self.world_state["cards_in_hand"][previous_owner] = np.zeros(len(CardTypes), dtype=np.int16)
+                        if self.dense_rewards:
+                            self.rewards[agent] += 0.3 / (self.num_agents-1)    # Wiping opponent is good
+                            self.rewards[self.agents[previous_owner]] -= 1.0    # Dying is bad
+
+                self.world_state["action_phase"] = RiskPhase.SELECT_EDGE
+                self.world_state["selected_edge"] = -1
+                self.strength_dirty = True
+                return False
+
+            case RiskPhase.TROOPS_MOVEMENT:
+                # Moving.
+                edge_id = self.world_state["selected_edge"]
+                src_node = self.risk_helper.edge_src[edge_id]
+                dst_node = self.risk_helper.edge_dst[edge_id]
+                moveable_troops = self.world_state["number_of_armies"][src_node]-1
+                troops_movement_amount = TroopActions[action].to_troops(moveable_troops)
+
+                self.world_state["number_of_armies"][src_node] -= troops_movement_amount
+                self.world_state["number_of_armies"][dst_node] += troops_movement_amount
+                if self.is_card_game:
+                    self.world_state["action_phase"] = RiskPhase.TRADE_CARDS
+                else:
+                    self.world_state["action_phase"] = RiskPhase.SELECT_NODE
+                self.world_state["selected_edge"] = -1
+                self.strength_dirty = True
+                return True
 
             case RiskPhase.TRADE_CARDS:
                 self.world_state["troops_to_place"] += self.risk_helper.cards_trade_amount(action)
@@ -426,15 +430,35 @@ class raw_env(AECEnv, EzPickle):
 
         return False
 
-    def _compute_reinforcements(self, agent : str) -> int:
+    def _compute_reinforcements(self) -> int:
 
-        if self.is_first_turn:
+        CLASSIC_MAP_SIZE = 42
+        DEFAULT_DENSITY = 2.8
+
+        # Troop reinforcements have been scaled with map size for the sake of balancing.
+        if not self.has_received_starting_reinforcement[self.current_agent_idx]:
+            self.has_received_starting_reinforcement[self.current_agent_idx] = True
+            self.is_first_turn = not np.all(self.has_received_starting_reinforcement)
             if self.n_agents in self._STARTING_REINFORCEMENTS:
-                return self._STARTING_REINFORCEMENTS[self.n_agents]
-            return 120//self.n_agents
+                starting_armies = round(
+                    self._STARTING_REINFORCEMENTS[self.n_agents]
+                    * self.num_nodes
+                    / CLASSIC_MAP_SIZE
+                )
+            else:
+                starting_armies = round(
+                    DEFAULT_DENSITY
+                    * self.num_nodes
+                    / self.n_agents
+                )
+            return starting_armies
 
         troops_owned_territories = self.territory_counts[self.current_agent_idx]
-        territory_armies = max(3, troops_owned_territories//3)
+        territory_armies = max(
+            1,
+            round(self.num_nodes / 14),
+            round(troops_owned_territories * 14 / self.num_nodes)
+        )
 
         continents_armies = 0
         for mask, bonus in self.continent_data:
@@ -472,27 +496,20 @@ class raw_env(AECEnv, EzPickle):
 
         return
 
+
     def _update_strength(self):
 
-        if self.world_state["action_phase"] == RiskPhase.STARTING_PLACEMENT or self.is_first_turn:
-            return np.zeros(self.n_agents, dtype=np.float32)
-
         territory_coeff = 1.0
-        troops_coeff = 0.5
-        continent_coeff = 1.0
+        troops_coeff = 1.0
+        continent_coeff = 5.0
 
         territory_owner = self.world_state["territory_owner"]
-        armies = self.world_state["number_of_armies"]
 
         territory_strength = territory_coeff * self.territory_counts / self.num_nodes
 
         troops_strength = troops_coeff * np.log1p(self.troop_counts) / self.log_max_troops
 
         continent_strength = np.zeros(self.n_agents, dtype=np.float32)
-
-        continent_spiky = 6.0
-
-        continent_exp_denom = np.exp(continent_spiky) - 1
 
         for mask, bonus in self.continent_data:
 
@@ -510,25 +527,67 @@ class raw_env(AECEnv, EzPickle):
 
         continent_strength = continent_coeff * continent_strength / self.max_continent_bonus
 
-        strength = territory_strength + troops_strength + continent_strength
-
-        total_strength = np.sum(strength)
-
-        relative_strength = (
-            strength
-            - (total_strength - strength) / (self.n_agents - 1)
-        )
-
         max_possible_strength = territory_coeff + troops_coeff + continent_coeff
 
-        reward_scale_strength = 0.5
-        rewards = reward_scale_strength * (
-            relative_strength - self.strength
+        strength = (
+            territory_strength
+            + troops_strength
+            + continent_strength
         ) / max_possible_strength
 
-        agents = self.agents
+        phi = strength
+
+        delta_phi = self.gamma*phi - self.prev_phi
+        raw_reward = delta_phi
+
+        raw_reward *= 0.5
+
+        self.prev_phi[:] = phi
 
         for i in range(self.n_agents):
-            self.rewards[agents[i]] += float(rewards[i])
+            self.rewards[self.agents[i]] += float(raw_reward[i])
 
-        self.strength[:] = relative_strength
+        self.strength_dirty = False
+
+    
+
+    def _compute_observation(self, agent : str) -> dict:
+        agent_idx = self.agent_to_idx[agent]
+
+        ws = self.world_state
+
+        obs = {
+            "territory_owner": ws["territory_owner"],
+            "number_of_armies": ws["number_of_armies"],
+            "action_phase": np.array(ws["action_phase"], dtype=np.int8),
+            "troops_to_place": np.array(ws["troops_to_place"], dtype=np.int16),
+            "selected_node": np.array(ws["selected_node"], dtype=np.int16),
+            "selected_edge": np.array(ws["selected_edge"], dtype=np.int16),
+        }
+
+        owners = obs["territory_owner"]
+        obs["territory_owner"] = np.where(
+            owners >= 0,
+            (owners - agent_idx) % self.n_agents,
+            owners
+        ).astype(np.int8)
+
+        if self.is_card_game:
+            cards = ws["cards_in_hand"]
+
+            obs["cards_in_hand"] = cards[agent_idx].copy()
+
+            obs["amount_cards_others"] = np.sum(cards, axis=1).astype(np.int16)
+            obs["amount_cards_others"] = np.delete(obs["amount_cards_others"], agent_idx)
+
+        action_mask = self.risk_helper.generate_action_mask(
+            agent_state=ws,
+            agent_id=agent_idx
+        )
+
+        observation = {
+            "observation": obs,
+            "action_mask": action_mask
+        }
+
+        return observation
