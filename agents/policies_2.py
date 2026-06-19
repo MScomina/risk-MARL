@@ -17,7 +17,7 @@ from tianshou.data import Collector, CollectStats, VectorReplayBuffer
 from tianshou.utils import TensorboardLogger
 from tianshou.trainer import OnPolicyTrainerParams
 
-from models import GraphNetwork
+from models.models import GraphNetwork
 
 class MARLRandomDiscreteMaskedOnPolicyAdapter(MARLRandomDiscreteMaskedOffPolicyAlgorithm):
 
@@ -56,7 +56,7 @@ class Args:
     watch = False
     agent_id = 1
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    load_model = True
+    load_model = False
     model_save_path = None
     log_interval_epochs = 1
     update_step_num_repetitions = 2
@@ -83,7 +83,7 @@ def main():
     env_params = [
         {
             "max_iters": min(args.env_start_steps * (2**(env_length//2)), args.env_max_steps),
-            "n_agents": 6,
+            "n_agents": 3,
             "map_path": f"./environment/maps/{args.map_name}.json",
             "is_card_game": True,
             "max_armies": 2000,
@@ -175,12 +175,10 @@ def main():
                     map_location=args.device)
         )
 
-    agents = [algorithm, copy.deepcopy(algorithm), copy.deepcopy(algorithm)] + [
+    agents = [algorithm] + [
         MARLRandomDiscreteMaskedOnPolicyAdapter(action_space=action_space)
-        for _ in range(env.num_agents - 3)
+        for _ in range(env.num_agents - 1)
     ]
-
-    agents[2].lr = 0.0
 
     marl_algorithm = MultiAgentOnPolicyAlgorithm(algorithms=agents, env=env)
 
