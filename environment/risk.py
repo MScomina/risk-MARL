@@ -224,7 +224,6 @@ class raw_env(AECEnv, EzPickle):
             self._update_strength()
 
         if self.territory_counts[self.current_agent_idx] == self.num_nodes:
-            print(f"{current_agent} has won!")
             for agent in self.agents:
                 if agent == current_agent:
                     self.rewards[agent] = 1.0
@@ -374,7 +373,7 @@ class raw_env(AECEnv, EzPickle):
     
     def _update_state_troops_reinforce(self, agent : str, action : int) -> bool:
         # Reinforcing own territory
-        troop_storage = self.world_state["troops_to_place"]
+        troop_storage = min(self.world_state["troops_to_place"], self.max_armies - self.world_state["number_of_armies"][self.world_state["selected_node"]])
         troop_reinforce_amount = self.troop_actions[action].to_troops(troop_storage)
         self.world_state["number_of_armies"][self.world_state["selected_node"]] += troop_reinforce_amount
         self.troop_counts[self.current_agent_idx] += troop_reinforce_amount

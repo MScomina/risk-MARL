@@ -47,14 +47,15 @@ class TroopAction(Enum):
 
     def __new__(cls, kind: str, val: float):
         obj = object.__new__(cls)
-        obj._value_ = val
         obj.kind = kind
+        obj.val = val
+        obj._value_ = (kind, val)
         return obj
 
     def to_troops(self, max_amount: int) -> int:
         if self.kind == "abs":
-             return min(int(self.value), max_amount)
-        return max(1, int(round(max_amount * self.value)))
+             return min(int(self.val), max_amount)
+        return max(1, int(round(max_amount * self.val)))
 
     @property
     def name_str(self):
