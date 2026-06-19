@@ -4,16 +4,19 @@
 import networkx as nx
 import numpy as np
 
+from dataclasses import dataclass, field
 from .maps import graph_utils
+from .constants import (
+    CardType,
+    RiskPhase,
+    TradeChoices,
+    TroopAction
+)
+from .config import CARD_TYPES, CARD_PROBS, TRADE_AMOUNTS
 
 import functools
-from dataclasses import dataclass
-from enum import Enum, IntEnum
-
-from pettingzoo import AECEnv
-from pettingzoo.utils.wrappers import BaseWrapper
-
 from gymnasium.spaces import Box, Dict, Discrete, Space
+
 
 # State/observation spaces info:
 #   territory_owner: The owner of the territory, -1 if owned by nobody.
@@ -30,211 +33,60 @@ from gymnasium.spaces import Box, Dict, Discrete, Space
 #   - Number of armies to use (if phase 3, 4 or 5, usually after a node/edge pick move)
 #   - Card trade combination (if phase 6, usually at the start of the turn)
 
-class CardTypes(IntEnum):
-    INFANTRY = 0
-    CAVALRY = 1
-    ARTILLERY = 2
-    JOKER = 3
 
-
-
-class TradeChoices(IntEnum):
-    NO_OP = 0
-    TRADE_ARTILLERY = 1
-    TRADE_INFANTRY = 2
-    TRADE_CAVALRY = 3
-    TRADE_MIXED = 4
-    TRADE_JOKER = 5
-
-
-
-class RiskPhase(IntEnum):
-    STARTING_PLACEMENT = 0
-    SELECT_NODE = 1
-    SELECT_EDGE = 2
-    TROOPS_REINFORCE = 3
-    TROOPS_ATTACK = 4
-    TROOPS_MOVEMENT = 5
-    TRADE_CARDS = 6
-
-
-
-class TroopAction(Enum):
-
-    ONE = ("abs", 1)
-    TWO = ("abs", 2)
-    THREE = ("abs", 3)
-    P1  = ("pct", 0.01)
-    P3  = ("pct", 0.03)
-    P5  = ("pct", 0.05)
-    P10 = ("pct", 0.10)
-    P15 = ("pct", 0.15)
-    P20 = ("pct", 0.20)
-    P30 = ("pct", 0.30)
-    P40 = ("pct", 0.40)
-    P50 = ("pct", 0.50)
-    P60 = ("pct", 0.60)
-    P80 = ("pct", 0.80)
-    P100 = ("pct", 1.00)
-
-    def __new__(cls, kind: str, val: float):
-        obj = object.__new__(cls)
-        obj._value_ = val
-        obj.kind = kind
-        return obj
-
-    def to_troops(self, max_amount: int) -> int:
-        if self.kind == "abs":
-             return min(int(self.value), max_amount)
-        return max(1, int(round(max_amount * self.value)))
-
-    @property
-    def name_str(self):
-        return self.name
-
-
-
-
-class TroopActionsMeta(type):
-    def __getitem__(cls, index):
-        return cls._TROOP_ACTIONS[index]
-
-    def __len__(cls) -> int:
-        return len(cls._TROOP_ACTIONS)
-
-    def __iter__(cls):
-        return iter(cls._TROOP_ACTIONS)
-
-
-
-
-class TroopActions(metaclass=TroopActionsMeta):
-    _TROOP_ACTIONS = tuple(TroopAction)
-
-
-class FlattenObservationWrapper(BaseWrapper):
-    
-    def __init__(self, env: AECEnv):
-        super().__init__(env)
-        
-        self._observation_spaces = {}
-        
-        for agent in env.possible_agents:
-            orig_space = env.observation_space(agent)
-            
-            if isinstance(orig_space, Dict) and "observation" in orig_space.spaces:
-                sub_space = orig_space.spaces["observation"]
-                flat_dim = 0
-                
-                for key, subspace in sub_space.spaces.items():
-                    if isinstance(subspace, Box):
-                        flat_dim += int(np.prod(subspace.shape))
-                    elif isinstance(subspace, Discrete):
-                        flat_dim += 1
-                    else:
-                        raise TypeError(f"Unsupported sub-space type: {type(subspace)}")
-                
-                flat_obs_space = Box(low=-1, high=32767, shape=(flat_dim,), dtype=np.int16)
-                
-                self._observation_spaces[agent] = Dict({
-                    "observation": flat_obs_space,
-                    "action_mask": orig_space.spaces["action_mask"]
-                })
-            else:
-                self._observation_spaces[agent] = orig_space
-
-    def observation_space(self, agent) -> Space:
-        return self._observation_spaces[agent]
-
-    def observe(self, agent) -> dict:
-        orig_obs = self.env.observe(agent)
-        if orig_obs is None:
-            return None
-            
-        obs_dict = orig_obs["observation"]
-        flat_parts = []
-        
-        for key, value in obs_dict.items():
-            if isinstance(value, np.ndarray):
-                flat_parts.append(value.ravel())
-            else:
-                flat_parts.append(np.array([value], dtype=np.int16))
-                
-        output_dict = {
-            "observation": np.concatenate(flat_parts).astype(np.int16),
-            "action_mask": orig_obs["action_mask"]
-        }
-        return output_dict
-
-
-
+@dataclass(slots=True)
 class RiskHelper():
 
-    _TRADE_AMOUNTS : dict[int | TradeChoices, int] = {
-        TradeChoices.NO_OP: 0,
-        TradeChoices.TRADE_ARTILLERY: 4,
-        TradeChoices.TRADE_INFANTRY: 6,
-        TradeChoices.TRADE_CAVALRY: 8,
-        TradeChoices.TRADE_MIXED: 10,
-        TradeChoices.TRADE_JOKER: 12
-    }
 
-    _CARD_DRAW_WEIGHTS : dict[int | CardTypes, int] = {
-        CardTypes.ARTILLERY: 15,
-        CardTypes.INFANTRY: 15,
-        CardTypes.CAVALRY: 10,
-        CardTypes.JOKER: 2
-    }
+    game_map : nx.DiGraph
+    num_agents : int
+    max_armies : int
+    is_card_game : bool
+    max_atk_def_troops : tuple[int, int]
+    is_blitz : bool
 
-    _CARD_TYPES = np.array(
-        list(_CARD_DRAW_WEIGHTS.keys()),
-        dtype=np.int8
-    )
+    rng : np.random.Generator = field(default_factory=np.random.default_rng)
 
-    _CARD_PROBS = np.array(
-        list(_CARD_DRAW_WEIGHTS.values()),
-        dtype=np.float32
-    )
+    num_nodes: int = field(init=False)
+    num_edges: int = field(init=False)
+    mask_size: int = field(init=False)
 
-    IS_ABS = np.array([a.kind == "abs" for a in TroopActions])
-    ABS = np.array([a.value for a in TroopActions])
-    PCT = np.array([a.value for a in TroopActions])
+    edge_src: np.ndarray = field(init=False)
+    edge_dst: np.ndarray = field(init=False)
 
-    _CARD_PROBS /= _CARD_PROBS.sum()
+    _IS_ABS: np.ndarray = field(init=False)
+    _ABS: np.ndarray   = field(init=False)
+    _PCT: np.ndarray   = field(init=False)
 
 
-    def __init__(self, game_map : nx.DiGraph, num_agents : int, max_armies : int, is_card_game : bool, max_atk_def_troops : tuple[int, int], 
-                 is_blitz : bool, rng: np.random.Generator | None = None):
+    # https://docs.python.org/3/library/dataclasses.html#dataclasses.__post_init__
+    def __post_init__(self) -> None:
+        self.num_nodes, self.num_edges = self.game_map.number_of_nodes(), self.game_map.number_of_edges()
+        self.mask_size = max(
+            self.num_nodes + 1,
+            self.num_edges + 1,
+            len(TroopAction),
+            len(TradeChoices)
+        )
 
-        self.game_map = game_map
-        self.num_agents = num_agents
-        self.max_armies = max_armies
-
-        self.num_nodes = self.game_map.number_of_nodes()
-        self.num_edges = self.game_map.number_of_edges()
-        self.mask_size = max(self.num_nodes + 1, self.num_edges + 1, len(TroopActions), len(TradeChoices))
-
-        self.is_card_game = is_card_game
-
-        self.max_atk_def_troops = max_atk_def_troops
-        self.is_blitz = is_blitz
-
-        if rng is None:
-            self.rng = np.random.default_rng()
-        else:
-            self.rng = rng
+        idx_to_edge = self.game_map.graph["idx_to_edge"]
+        node_to_idx = self.game_map.graph["node_to_idx"]
 
         self.edge_src = np.empty(self.num_edges, dtype=np.int16)
         self.edge_dst = np.empty(self.num_edges, dtype=np.int16)
 
-        for idx, (src, dst) in self.game_map.graph["idx_to_edge"].items():
-            self.edge_src[idx] = self.game_map.graph["node_to_idx"][src]
-            self.edge_dst[idx] = self.game_map.graph["node_to_idx"][dst]
+        for idx, (src, dst) in idx_to_edge.items():
+            self.edge_src[idx] = node_to_idx[src]
+            self.edge_dst[idx] = node_to_idx[dst]
+
+        self._IS_ABS = np.array([a.kind == "abs" for a in TroopAction])
+        self._ABS = np.array([a.value for a in TroopAction], dtype=np.int32)
+        self._PCT = np.array([a.value for a in TroopAction], dtype=np.float32)
 
 
     def observation_space(self) -> Dict:
 
-        observation_base = {
+        observation_base : dict[str, Space] = {
             "territory_owner": Box(low=-1, high=self.num_agents, shape=(self.num_nodes, ), dtype=np.int8),
             "number_of_armies": Box(low=0, high=self.max_armies+1, shape=(self.num_nodes, ), dtype=np.int16),
             "action_phase" : Discrete(len(RiskPhase), dtype=np.int8),
@@ -244,31 +96,10 @@ class RiskHelper():
         }
 
         if self.is_card_game:
-            observation_base["cards_in_hand"] = Box(low=0, high=32767, shape=(len(CardTypes), ), dtype=np.int16)
+            observation_base["cards_in_hand"] = Box(low=0, high=32767, shape=(len(CardType), ), dtype=np.int16)
             observation_base["amount_cards_others"] = Box(low=0, high=32767, shape=(self.num_agents-1, ), dtype=np.int16)
         
         return Dict(observation_base)
-
-
-    def starting_observation(self, full_knowledge : bool = False) -> dict:
-
-        observation = {
-            "territory_owner" : np.full(shape=self.num_nodes, fill_value=-1, dtype=np.int8),
-            "number_of_armies" : np.zeros(self.num_nodes, dtype=np.int16),
-            "action_phase" : np.array(0, dtype=np.int8),
-            "troops_to_place" : np.array(0, dtype=np.int16),
-            "selected_node": np.array(-1, dtype=np.int16),
-            "selected_edge": np.array(-1, dtype=np.int16)
-        }
-
-        if self.is_card_game:
-            if full_knowledge:
-                observation["cards_in_hand"] = np.zeros((self.num_agents, len(CardTypes)), dtype=np.int16)
-            else:
-                observation["cards_in_hand"] = np.zeros(len(CardTypes), dtype=np.int16)
-                observation["amount_cards_others"] = np.zeros(self.num_agents-1, dtype=np.int16)
-
-        return observation
 
 
     def action_space(self) -> Dict:
@@ -279,6 +110,27 @@ class RiskHelper():
     def mask_space(self) -> Dict:
 
         return Box(low=0, high=1, shape=(self.mask_size, ), dtype=np.int8)
+
+
+    def starting_observation(self, full_knowledge : bool = False) -> dict:
+
+        observation : dict[str, np.ndarray] = {
+            "territory_owner" : np.full(shape=self.num_nodes, fill_value=-1, dtype=np.int8),
+            "number_of_armies" : np.zeros(self.num_nodes, dtype=np.int16),
+            "action_phase" : np.array(0, dtype=np.int8),
+            "troops_to_place" : np.array(0, dtype=np.int16),
+            "selected_node": np.array(-1, dtype=np.int16),
+            "selected_edge": np.array(-1, dtype=np.int16)
+        }
+
+        if self.is_card_game:
+            if full_knowledge:
+                observation["cards_in_hand"] = np.zeros((self.num_agents, len(CardType)), dtype=np.int16)
+            else:
+                observation["cards_in_hand"] = np.zeros(len(CardType), dtype=np.int16)
+                observation["amount_cards_others"] = np.zeros(self.num_agents-1, dtype=np.int16)
+
+        return observation
 
 
     def generate_action_mask(self, agent_id : int, agent_state : dict) -> np.ndarray:
@@ -345,13 +197,14 @@ class RiskHelper():
     def _mask_select_node(self, agent_id : int, state : dict) -> np.ndarray:
         # Since the only time one can pick a node that is NOT the starting placement phase is to reinforce, one can pick any owned nodes.
         mask = np.zeros(self.num_nodes+1, dtype=np.int8)
-
         owned = (state["territory_owner"] == agent_id)
         can_expand = (state["number_of_armies"] < self.max_armies)
         valid_nodes = owned & can_expand
         
         mask[:-1] = valid_nodes
 
+        # No-op action if there's no available nodes.
+        # It might happen if an agent has filled all of its nodes or somehow has 0 nodes (should not happen).
         if not valid_nodes.any():
             mask[-1] = 1
 
@@ -381,6 +234,8 @@ class RiskHelper():
             ~dst_full
         )
 
+        # No-op operation if there's no available edges FOR MOVEMENT ACTION.
+        # This can happen if an agent's territories are all disjointed, and they would essentially never pass turn without an allowed movement action.
         if not has_movement:
             mask[-1] = 1
 
@@ -388,7 +243,6 @@ class RiskHelper():
 
 
     def _mask_troops_reinforce(self, state, agent_id):
-        mask = np.zeros(len(TroopActions), dtype=np.int8)
 
         assert state["selected_node"] != -1, (
             "Current state is invalid: node has not been selected in troops_reinforce."
@@ -401,12 +255,10 @@ class RiskHelper():
             self.max_armies - current,
         )
 
-        mask[:] = self._valid_troops_mask(state["troops_to_place"], max_placeable)
-        return mask
+        return self._valid_troops_mask(state["troops_to_place"], max_placeable)
 
 
     def _mask_troops_attack(self, state, agent_id):
-        mask = np.zeros(len(TroopActions), dtype=np.int8)
 
         assert state["selected_edge"] != -1, (
             "Current state is invalid: edge has not been selected in troops_attack."
@@ -419,13 +271,10 @@ class RiskHelper():
         if not self.is_blitz:
             max_allowed = min(source, self.max_atk_def_troops[0])
 
-        mask[:] = self._valid_troops_mask(source-1, max_allowed)
-        return mask
+        return self._valid_troops_mask(source-1, max_allowed)
 
 
     def _mask_troops_movement(self, state, agent_id):
-        mask = np.zeros(len(TroopActions), dtype=np.int8)
-
         assert state["selected_edge"] != -1, (
             "Current state is invalid: edge has not been selected in troops_movement."
         )
@@ -439,58 +288,54 @@ class RiskHelper():
 
         movable = min(source - 1, self.max_armies - dest)
 
-        mask[:] = self._valid_troops_mask(source-1, movable)
-        return mask
+        return self._valid_troops_mask(source-1, movable)
 
 
     def _mask_trade_cards(self, state : dict, agent_id : int) -> np.ndarray:
         
         mask = np.zeros(len(TradeChoices), dtype=np.int8)
 
-        normal_cards_counts = state["cards_in_hand"][agent_id][[CardTypes.INFANTRY, CardTypes.CAVALRY, CardTypes.ARTILLERY]]
+        normal_cards_counts = state["cards_in_hand"][agent_id][[CardType.INFANTRY, CardType.CAVALRY, CardType.ARTILLERY]]
 
         mask[TradeChoices.NO_OP] = 1
-        mask[TradeChoices.TRADE_ARTILLERY] = int(state["cards_in_hand"][agent_id][CardTypes.ARTILLERY] >= 3)
-        mask[TradeChoices.TRADE_INFANTRY] = int(state["cards_in_hand"][agent_id][CardTypes.INFANTRY] >= 3)
-        mask[TradeChoices.TRADE_CAVALRY] = int(state["cards_in_hand"][agent_id][CardTypes.CAVALRY] >= 3)
+        mask[TradeChoices.TRADE_ARTILLERY] = int(state["cards_in_hand"][agent_id][CardType.ARTILLERY] >= 3)
+        mask[TradeChoices.TRADE_INFANTRY] = int(state["cards_in_hand"][agent_id][CardType.INFANTRY] >= 3)
+        mask[TradeChoices.TRADE_CAVALRY] = int(state["cards_in_hand"][agent_id][CardType.CAVALRY] >= 3)
         mask[TradeChoices.TRADE_MIXED] = int((normal_cards_counts >= 1).all())
-        mask[TradeChoices.TRADE_JOKER] = int(state["cards_in_hand"][agent_id][CardTypes.JOKER] >= 1 and (normal_cards_counts >= 2).any())
+        mask[TradeChoices.TRADE_JOKER] = int(state["cards_in_hand"][agent_id][CardType.JOKER] >= 1 and (normal_cards_counts >= 2).any())
 
         return mask
 
+    
+    def _raw_troops(self, raw: np.ndarray) -> np.ndarray:
+        abs_mask = self._IS_ABS
+        pct_vals = (self.max_armies * self._PCT).astype(int)
+        return np.where(abs_mask, self._ABS, pct_vals)
 
-    def _generate_continent_masks(self) -> dict:
-        
-        continent_masks = {}
-        for continent, data in self.game_map.graph["continents"].items():
-            mask = np.zeros(self.num_nodes, dtype=bool)
-            for terr in data["territories"]:
-                idx = self.game_map.graph["node_to_idx"][terr]
-                mask[idx] = True
-            continent_masks[continent] = mask
 
-        return continent_masks
+    def _valid_troops_mask(self, raw: int | np.ndarray, max_amount: int) -> np.ndarray:
+        troops = self._raw_troops(raw)
+        return (troops >= 1) & (troops <= max_amount)
 
 
     @staticmethod
     def cards_trade_amount(trade_type : int | TradeChoices) -> int:
-        return RiskHelper._TRADE_AMOUNTS[trade_type]
+        return TRADE_AMOUNTS[trade_type]
 
 
     @staticmethod
     def draw_card(rng : np.random.Generator | None = None) -> int:
-        if rng is None:
-            rng = np.random.default_rng()
+        rng = rng or np.random.default_rng()
         # If one wants to develop an actual drawing setup with a deck, this function is to change.
         # For simplicity, it has just been reduced to drawing from a RNG generator.
         return rng.choice(
-            RiskHelper._CARD_TYPES,
-            p=RiskHelper._CARD_PROBS
+            CARD_TYPES,
+            p=CARD_PROBS
         )
 
 
     @staticmethod
-    def risk_attack_outcome(atk_armies : int, def_armies : int, rng: np.random.Generator | None = None, max_atk_def_troops : tuple[int, int] = (3, 2)) -> tuple[int, int]:
+    def risk_attack_outcome(atk_armies : int, def_armies : int, rng: np.random.Generator | None = None, max_atk_def_troops : tuple[int, int] = (3, 2)) -> tuple[int, int, int]:
         
         if rng is None:
             rng = np.random.default_rng()
@@ -538,17 +383,3 @@ class RiskHelper():
 
         # Attack has won.
         return total_atk_losses, total_def_losses, int(last_atk_dice)
-
-    def _raw_troops(self, max_amount: int):
-        abs_troops = self.ABS
-        pct_troops = np.maximum(1, (max_amount * self.PCT).astype(int))
-
-        return np.where(self.IS_ABS, abs_troops, pct_troops)
-
-    def _valid_troops_mask(self, raw_troops : int, max_amount: int):
-        troops = self._raw_troops(raw_troops)
-
-        return (
-            (troops >= 1) &
-            (troops <= max_amount)
-        )
