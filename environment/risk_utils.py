@@ -80,8 +80,8 @@ class RiskHelper():
             self.edge_dst[idx] = node_to_idx[dst]
 
         self._IS_ABS = np.array([a.kind == "abs" for a in TroopAction])
-        self._ABS = np.array([a.value for a in TroopAction], dtype=np.int32)
-        self._PCT = np.array([a.value for a in TroopAction], dtype=np.float32)
+        self._ABS = np.array([a.val for a in TroopAction], dtype=np.int32)
+        self._PCT = np.array([a.val for a in TroopAction], dtype=np.float32)
 
 
     def observation_space(self) -> Dict:
@@ -307,13 +307,13 @@ class RiskHelper():
         return mask
 
     
-    def _raw_troops(self, raw: np.ndarray) -> np.ndarray:
+    def _raw_troops(self, raw: int) -> np.ndarray:
         abs_mask = self._IS_ABS
-        pct_vals = (self.max_armies * self._PCT).astype(int)
+        pct_vals = np.maximum((raw * self._PCT).astype(int), 1)
         return np.where(abs_mask, self._ABS, pct_vals)
 
 
-    def _valid_troops_mask(self, raw: int | np.ndarray, max_amount: int) -> np.ndarray:
+    def _valid_troops_mask(self, raw: int, max_amount: int) -> np.ndarray:
         troops = self._raw_troops(raw)
         return (troops >= 1) & (troops <= max_amount)
 
