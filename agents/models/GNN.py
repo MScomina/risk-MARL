@@ -158,7 +158,7 @@ class GraphNetwork(nn.Module):
         parameter_out_shape = max(len(TradeChoices), len(TroopAction)) if not self.is_likely_critic else 1
         self.parameter_head = nn.Linear(self.res_hidden_s, parameter_out_shape)
 
-        projection_size = (len(self.pool_layers_aggrs)*self.gnn_hidden_s) + 1 # pooling layers and reinforcements
+        projection_size = (len(self.pool_layers_aggrs)*self.gnn_hidden_s) + 1 # Pooling layers and reinforcements
 
         self.film_block = FiLMBlock(self.embed_space_phase, self.res_hidden_s)
 
@@ -198,7 +198,6 @@ class GraphNetwork(nn.Module):
         else:
             obs_dict = obs
 
-        # Basic initialization
         territory_owner = torch.as_tensor(obs_dict["territory_owner"], dtype=torch.long, device=device)
         selected_node = torch.as_tensor(obs_dict["selected_node"], dtype=torch.long, device=device)
         selected_edge = torch.as_tensor(obs_dict["selected_edge"], dtype=torch.long, device=device)
@@ -376,7 +375,6 @@ class GraphNetwork(nn.Module):
                     phase_scores = phase_scores.squeeze(-1)
                     phase_scores = phase_scores.view(batch_size, -1)
 
-                    full_logits[phase_mask, phase_scores.shape[1]] = -1e6   # Arbitrarily large but not infinite logit for the No-op operation
                     full_logits[phase_mask, :phase_scores.shape[1]] = phase_scores[phase_mask]
 
                 elif phase in [RiskPhase.SELECT_EDGE]:
