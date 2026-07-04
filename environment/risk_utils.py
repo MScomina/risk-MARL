@@ -1,82 +1,120 @@
+# https://gymnasium.farama.org/api/spaces/
+# Inspiration for environment (masking): https://github.com/Farama-Foundation/PettingZoo/blob/master/pettingzoo/classic/chess/chess.py
+
 import networkx as nx
 import numpy as np
 
+from dataclasses import dataclass, field
 from .maps import graph_utils
+from .constants import (
+    CardType,
+    RiskPhase,
+    TradeChoices,
+    TroopAction
+)
+from .config import CARD_TYPES, CARD_PROBS, TRADE_AMOUNTS
 
 import functools
-from enum import IntEnum
+from gymnasium.spaces import Box, Dict, Discrete, Space
 
-from gymnasium.spaces import Box, Dict, Discrete
 
 # State/observation spaces info:
 #   territory_owner: The owner of the territory, -1 if owned by nobody.
 #   number_of_armies: Number of armies in a territory.
-#   action_phase: Number representing the phase (0: initial placing, 1: select army count, 2: select node, 3: select edge)
+#   action_phase: Number representing the phase (0: initial placing, 1: select army count, 2: select node, 3: select edge, 4: trade cards)
 #   troops_to_place: How many reinforcement troops are left to place (if reinforcement phase).
 #   selected_node: Node ID selected in a previous select_node move, -1 if not selected.
 #   selected_edge: Edge ID selected in a previous select_edge move, -1 if not selected.
 
 # Action space info:
 #   The action is a single number representing, based on the current action_phase, either:
-#   - Node ID to pick (if phase 0 or 2, usually meant for reinforcements) + 1 (No-op case)
-#   - Edge ID to pick (if phase 3, usually meant for movement/attack) + 1 (No-op case)
-#   - Number of armies to use (if phase 1, usually after a node/edge pick move)
+#   - Node ID to pick (if phase 0 or 1, usually meant for reinforcements) + 1 (No-op case)
+#   - Edge ID to pick (if phase 2, usually meant for movement/attack) + 1 (No-op case)
+#   - Number of armies to use (if phase 3, 4 or 5, usually after a node/edge pick move)
+#   - Card trade combination (if phase 6, usually at the start of the turn)
 
-class CardTypes(IntEnum):
-    INFANTRY = 0
-    CAVALRY = 1
-    ARTILLERY = 2
-    JOKER = 3
 
-class TradeChoices(IntEnum):
-    NO_OP = 0
-    TRADE_ARTILLERY = 1
-    TRADE_INFANTRY = 2
-    TRADE_CAVALRY = 3
-    TRADE_MIXED = 4
-    TRADE_JOKER = 5
-
-class RiskPhase(IntEnum):
-    STARTING_PLACEMENT = 0
-    SELECT_ARMY_COUNT = 1
-    SELECT_NODE = 2
-    SELECT_EDGE = 3
-    TRADE_CARDS = 4
-
+@dataclass(slots=True)
 class RiskHelper():
 
-    def __init__(self, game_map : nx.DiGraph, num_agents : int, max_armies : int, is_card_game : bool):
 
-        self.game_map = game_map
-        self.num_agents = num_agents
-        self.max_armies = max_armies
+    game_map : nx.DiGraph
+    num_agents : int
+    max_armies : int
+    is_card_game : bool
+    max_atk_def_troops : tuple[int, int]
+    is_blitz : bool
 
-        self.num_nodes = self.game_map.number_of_nodes()
-        self.num_edges = self.game_map.number_of_edges()
-        self.mask_size = max(self.num_nodes + 1, self.num_edges + 1, self.max_armies, len(TradeChoices))
+    rng : np.random.Generator = field(default_factory=np.random.default_rng)
 
-        self.is_card_game = is_card_game
+    num_nodes: int = field(init=False)
+    num_edges: int = field(init=False)
+    mask_size: int = field(init=False)
+
+    edge_src: np.ndarray = field(init=False)
+    edge_dst: np.ndarray = field(init=False)
+
+    _IS_ABS: np.ndarray = field(init=False)
+    _ABS: np.ndarray   = field(init=False)
+    _PCT: np.ndarray   = field(init=False)
+
+
+    # https://docs.python.org/3/library/dataclasses.html#dataclasses.__post_init__
+    def __post_init__(self) -> None:
+        self.num_nodes, self.num_edges = self.game_map.number_of_nodes(), self.game_map.number_of_edges()
+        self.mask_size = max(
+            self.num_nodes + 1,
+            self.num_edges + 1,
+            len(TroopAction),
+            len(TradeChoices)
+        )
+
+        idx_to_edge = self.game_map.graph["idx_to_edge"]
+        node_to_idx = self.game_map.graph["node_to_idx"]
+
+        self.edge_src = np.empty(self.num_edges, dtype=np.int16)
+        self.edge_dst = np.empty(self.num_edges, dtype=np.int16)
+
+        for idx, (src, dst) in idx_to_edge.items():
+            self.edge_src[idx] = node_to_idx[src]
+            self.edge_dst[idx] = node_to_idx[dst]
+
+        self._IS_ABS = np.array([a.kind == "abs" for a in TroopAction])
+        self._ABS = np.array([a.val for a in TroopAction], dtype=np.int32)
+        self._PCT = np.array([a.val for a in TroopAction], dtype=np.float32)
+
 
     def observation_space(self) -> Dict:
 
-        observation_base = {
-                "territory_owner": Box(low=-1, high=self.num_agents, shape=(self.num_nodes, ), dtype=np.int8),
-                "number_of_armies": Box(low=0, high=self.max_armies+1, shape=(self.num_nodes, ), dtype=np.int16),
-                "action_phase" : Discrete(len(RiskPhase), dtype=np.int8),
-                "troops_to_place" : Discrete(self.max_armies, dtype=np.int16),
-                "selected_node": Discrete(self.num_nodes+1, start=-1, dtype=np.int16),
-                "selected_edge": Discrete(self.num_edges+1, start=-1, dtype=np.int16),
+        observation_base : dict[str, Space] = {
+            "territory_owner": Box(low=-1, high=self.num_agents, shape=(self.num_nodes, ), dtype=np.int8),
+            "number_of_armies": Box(low=0, high=self.max_armies+1, shape=(self.num_nodes, ), dtype=np.int16),
+            "action_phase" : Discrete(len(RiskPhase), dtype=np.int8),
+            "troops_to_place" : Discrete(32767, dtype=np.int16),
+            "selected_node": Discrete(self.num_nodes+1, start=-1, dtype=np.int16),
+            "selected_edge": Discrete(self.num_edges+1, start=-1, dtype=np.int16),
         }
 
         if self.is_card_game:
-            observation_base["cards_in_hand"] = Box(low=0, high=32767, shape=(len(CardTypes), ), dtype=np.int16)
+            observation_base["cards_in_hand"] = Box(low=0, high=32767, shape=(len(CardType), ), dtype=np.int16)
             observation_base["amount_cards_others"] = Box(low=0, high=32767, shape=(self.num_agents-1, ), dtype=np.int16)
         
         return Dict(observation_base)
 
+
+    def action_space(self) -> Dict:
+
+        return Discrete(self.mask_size, dtype=np.int64)
+
+
+    def mask_space(self) -> Dict:
+
+        return Box(low=0, high=1, shape=(self.mask_size, ), dtype=np.int8)
+
+
     def starting_observation(self, full_knowledge : bool = False) -> dict:
 
-        observation = {
+        observation : dict[str, np.ndarray] = {
             "territory_owner" : np.full(shape=self.num_nodes, fill_value=-1, dtype=np.int8),
             "number_of_armies" : np.zeros(self.num_nodes, dtype=np.int16),
             "action_phase" : np.array(0, dtype=np.int8),
@@ -87,20 +125,13 @@ class RiskHelper():
 
         if self.is_card_game:
             if full_knowledge:
-                observation["cards_in_hand"] = np.zeros((self.num_agents, len(CardTypes)), dtype=np.int16)
+                observation["cards_in_hand"] = np.zeros((self.num_agents, len(CardType)), dtype=np.int16)
             else:
-                observation["cards_in_hand"] = np.zeros(len(CardTypes), dtype=np.int16)
+                observation["cards_in_hand"] = np.zeros(len(CardType), dtype=np.int16)
                 observation["amount_cards_others"] = np.zeros(self.num_agents-1, dtype=np.int16)
 
         return observation
 
-    def action_space(self) -> Dict:
-
-        return Discrete(self.mask_size, dtype=np.int32)
-
-    def mask_space(self) -> Dict:
-
-        return Box(low=0, high=1, shape=(self.mask_size, ), dtype=np.int8)
 
     def generate_action_mask(self, agent_id : int, agent_state : dict) -> np.ndarray:
 
@@ -123,8 +154,20 @@ class RiskHelper():
                     agent_id=agent_id
                 )
 
-            case RiskPhase.SELECT_ARMY_COUNT:
-                mask = self._mask_select_army_count(
+            case RiskPhase.TROOPS_REINFORCE:
+                mask = self._mask_troops_reinforce(
+                    state=agent_state,
+                    agent_id=agent_id
+                )
+
+            case RiskPhase.TROOPS_ATTACK:
+                mask = self._mask_troops_attack(
+                    state=agent_state,
+                    agent_id=agent_id
+                )
+
+            case RiskPhase.TROOPS_MOVEMENT:
+                mask = self._mask_troops_movement(
                     state=agent_state,
                     agent_id=agent_id
                 )
@@ -147,152 +190,196 @@ class RiskHelper():
 
     
     def _mask_starting_placement(self, state : dict) -> np.ndarray:
-    # Still placing at the start, can place one in ANY UNOWNED territories.
+        # Still placing at the start, can place one in ANY UNOWNED territories.
         return (state["territory_owner"] == -1).astype(np.int8)
+
 
     def _mask_select_node(self, agent_id : int, state : dict) -> np.ndarray:
         # Since the only time one can pick a node that is NOT the starting placement phase is to reinforce, one can pick any owned nodes.
         mask = np.zeros(self.num_nodes+1, dtype=np.int8)
-
         owned = (state["territory_owner"] == agent_id)
         can_expand = (state["number_of_armies"] < self.max_armies)
         valid_nodes = owned & can_expand
         
-        valid_indices = np.where(valid_nodes)[0]
-        mask[valid_indices] = 1
+        mask[:-1] = valid_nodes
 
-        if len(valid_indices) == 0:
-            # No node possible, either the agent is dead or no more troops can be placed. No-op.
+        # No-op action if there's no available nodes.
+        # It might happen if an agent has filled all of its nodes or somehow has 0 nodes (should not happen).
+        if not valid_nodes.any():
             mask[-1] = 1
 
         return mask
 
-    def _mask_select_edge(self, state : dict, agent_id : int) -> np.ndarray:
 
-        mask = np.zeros(self.num_edges+1, dtype=np.int8)
-        owned_nodes = set(np.where(state["territory_owner"] == agent_id)[0])
-        has_movement = False
+    def _mask_select_edge(self, state: dict, agent_id: int) -> np.ndarray:
 
-        for src_node in owned_nodes:
-            if state["number_of_armies"][src_node] <= 1:
-                # Source node only has one army, can't move or attack.
-                continue
-            for edge in self.game_map.out_edges(self.game_map.graph["idx_to_node"][src_node]):
-                dst_node = self.game_map.graph["node_to_idx"][edge[1]]
-                if not has_movement and (dst_node in owned_nodes and not state["number_of_armies"][dst_node] >= self.max_armies):
-                    has_movement = True
-                if not (dst_node in owned_nodes and state["number_of_armies"][dst_node] >= self.max_armies):
-                    mask[self.game_map.graph["edge_to_idx"][edge]] = 1
+        mask = np.zeros(self.num_edges + 1, dtype=np.int8)
 
+        owners = state["territory_owner"]
+        armies = state["number_of_armies"]
+
+        src_owned = owners[self.edge_src] == agent_id
+        src_can_act = armies[self.edge_src] > 1
+
+        valid_src = src_owned & src_can_act
+
+        dst_owned = owners[self.edge_dst] == agent_id
+        dst_full = armies[self.edge_dst] >= self.max_armies
+
+        mask[:-1] = valid_src & ~(dst_owned & dst_full)
+
+        has_movement = np.any(
+            valid_src &
+            dst_owned &
+            ~dst_full
+        )
+
+        # No-op operation if there's no available edges FOR MOVEMENT ACTION.
+        # This can happen if an agent's territories are all disjointed, and they would essentially never pass turn without an allowed movement action.
         if not has_movement:
-            # No movement action found, must allow No-op/pass turn action.
             mask[-1] = 1
 
         return mask
 
-    def _mask_select_army_count(self, state : dict, agent_id : int) -> np.ndarray:
 
-        mask = np.zeros(self.max_armies, dtype=np.int8)
-        owned_nodes = set(np.where(state["territory_owner"] == agent_id)[0].tolist())
+    def _mask_troops_reinforce(self, state, agent_id):
 
-        if state["troops_to_place"] > 0:
-            # Still has reinforcement troops to place. Assuming a node has already been picked.
-            if state["selected_node"] == -1:
-                raise RuntimeError(f"Inconsistent world space: selected_node is -1.")
-            current_troops = state["number_of_armies"][state["selected_node"]]
-            mask[1:min(state["troops_to_place"]+1,self.max_armies-current_troops+1)] = 1
-        else:
-            # No reinforcement troops means this is likely an attack/move action.
-            if state["selected_edge"] == -1:
-                raise RuntimeError(f"Inconsistent world space: selected_edge is -1.")
-            edge = self.game_map.graph["idx_to_edge"][state["selected_edge"]]
-            source_node_armies = state["number_of_armies"][self.game_map.graph["node_to_idx"][edge[0]]]
-            dst = self.game_map.graph["node_to_idx"][self.game_map.graph["idx_to_edge"][state["selected_edge"]][1]]
-            dst_node_armies = state["number_of_armies"][dst]
-            if self.game_map.graph["node_to_idx"][self.game_map.graph["idx_to_edge"][state["selected_edge"]][1]] in owned_nodes:
-                # This is a movement action.
-                mask[1:min(source_node_armies, self.max_armies-dst_node_armies+1)] = 1
-            else:
-                # This is an attack action.
-                mask[1:min(source_node_armies, 4)] = 1
+        assert state["selected_node"] != -1, (
+            "Current state is invalid: node has not been selected in troops_reinforce."
+        )
 
-        return mask
+        current = state["number_of_armies"][state["selected_node"]]
+
+        max_placeable = min(
+            state["troops_to_place"],
+            self.max_armies - current,
+        )
+
+        return self._valid_troops_mask(state["troops_to_place"], max_placeable)
+
+
+    def _mask_troops_attack(self, state, agent_id):
+
+        assert state["selected_edge"] != -1, (
+            "Current state is invalid: edge has not been selected in troops_attack."
+        )
+
+        edge = state["selected_edge"]
+        source = state["number_of_armies"][self.edge_src[edge]]
+
+        max_allowed = source - 1
+        if not self.is_blitz:
+            max_allowed = min(source, self.max_atk_def_troops[0])
+
+        return self._valid_troops_mask(source-1, max_allowed)
+
+
+    def _mask_troops_movement(self, state, agent_id):
+        assert state["selected_edge"] != -1, (
+            "Current state is invalid: edge has not been selected in troops_movement."
+        )
+
+        edge = state["selected_edge"]
+        src = self.edge_src[edge]
+        dst = self.edge_dst[edge]
+
+        source = state["number_of_armies"][src]
+        dest = state["number_of_armies"][dst]
+
+        movable = min(source - 1, self.max_armies - dest)
+
+        return self._valid_troops_mask(source-1, movable)
+
 
     def _mask_trade_cards(self, state : dict, agent_id : int) -> np.ndarray:
         
         mask = np.zeros(len(TradeChoices), dtype=np.int8)
 
-        normal_cards_counts = state["cards_in_hand"][agent_id][[CardTypes.INFANTRY.value, CardTypes.CAVALRY.value, CardTypes.ARTILLERY.value]]
+        normal_cards_counts = state["cards_in_hand"][agent_id][[CardType.INFANTRY, CardType.CAVALRY, CardType.ARTILLERY]]
 
-        mask[TradeChoices.NO_OP.value] = 1
-        mask[TradeChoices.TRADE_ARTILLERY.value] = int(state["cards_in_hand"][agent_id][CardTypes.ARTILLERY.value] >= 3)
-        mask[TradeChoices.TRADE_INFANTRY.value] = int(state["cards_in_hand"][agent_id][CardTypes.INFANTRY.value] >= 3)
-        mask[TradeChoices.TRADE_CAVALRY.value] = int(state["cards_in_hand"][agent_id][CardTypes.CAVALRY.value] >= 3)
-        mask[TradeChoices.TRADE_MIXED.value] = int((normal_cards_counts >= 1).all())
-        mask[TradeChoices.TRADE_JOKER.value] = int(state["cards_in_hand"][agent_id][CardTypes.JOKER.value] >= 1 and (normal_cards_counts >= 2).any())
+        mask[TradeChoices.NO_OP] = 1
+        mask[TradeChoices.TRADE_ARTILLERY] = int(state["cards_in_hand"][agent_id][CardType.ARTILLERY] >= 3)
+        mask[TradeChoices.TRADE_INFANTRY] = int(state["cards_in_hand"][agent_id][CardType.INFANTRY] >= 3)
+        mask[TradeChoices.TRADE_CAVALRY] = int(state["cards_in_hand"][agent_id][CardType.CAVALRY] >= 3)
+        mask[TradeChoices.TRADE_MIXED] = int((normal_cards_counts >= 1).all())
+        mask[TradeChoices.TRADE_JOKER] = int(state["cards_in_hand"][agent_id][CardType.JOKER] >= 1 and (normal_cards_counts >= 2).any())
 
         return mask
 
-    def _generate_continent_masks(self) -> dict:
-        
-        continent_masks = {}
-        for continent, data in self.game_map.graph["continents"].items():
-            mask = np.zeros(self.num_nodes, dtype=bool)
-            for terr in data["territories"]:
-                idx = self.game_map.graph["node_to_idx"][terr]
-                mask[idx] = True
-            continent_masks[continent] = mask
+    
+    def _raw_troops(self, raw: int) -> np.ndarray:
+        abs_mask = self._IS_ABS
+        pct_vals = np.maximum((raw * self._PCT).astype(int), 1)
+        return np.where(abs_mask, self._ABS, pct_vals)
 
-        return continent_masks
+
+    def _valid_troops_mask(self, raw: int, max_amount: int) -> np.ndarray:
+        troops = self._raw_troops(raw)
+        return (troops >= 1) & (troops <= max_amount)
+
 
     @staticmethod
     def cards_trade_amount(trade_type : int | TradeChoices) -> int:
-        match trade_type:
-            case TradeChoices.NO_OP:
-                return 0
-            case TradeChoices.TRADE_ARTILLERY:
-                return 4
-            case TradeChoices.TRADE_INFANTRY:
-                return 6
-            case TradeChoices.TRADE_CAVALRY:
-                return 8
-            case TradeChoices.TRADE_MIXED:
-                return 10
-            case TradeChoices.TRADE_JOKER:
-                return 12
-            case _:
-                raise ValueError(f"Undefined trade amount called: {trade_type}")
-        return 0
+        return TRADE_AMOUNTS[trade_type]
+
 
     @staticmethod
-    def draw_card(rng : np.random.Generator = np.random.default_rng()) -> int:
+    def draw_card(rng : np.random.Generator | None = None) -> int:
+        rng = rng or np.random.default_rng()
         # If one wants to develop an actual drawing setup with a deck, this function is to change.
         # For simplicity, it has just been reduced to drawing from a RNG generator.
-        weights = [15, 15, 10, 2]
-        probs = [w / sum(weights) for w in weights]
-        return CardTypes(rng.choice(len(weights), p=probs))
+        return rng.choice(
+            CARD_TYPES,
+            p=CARD_PROBS
+        )
 
 
     @staticmethod
-    def risk_attack_outcome(atk_armies : int, def_armies : int, rng: np.random.Generator = np.random.default_rng()) -> tuple[int, int]:
-        # Given a number of attackers and defenders, returns the number of losses on both sides.
-        atk_dice = min(3, atk_armies)
-        def_dice = min(2, def_armies)
+    def risk_attack_outcome(atk_armies : int, def_armies : int, rng: np.random.Generator | None = None, max_atk_def_troops : tuple[int, int] = (3, 2)) -> tuple[int, int, int]:
+        
+        if rng is None:
+            rng = np.random.default_rng()
 
-        atk_roll = rng.integers(1, 7, size=atk_dice)
-        def_roll = rng.integers(1, 7, size=def_dice)
+        # Given a number of atk armies and def_armies, reiterate battle until either side is at 0.
+        # Battles can be reiterated and have any amount of dices at a time.
+        # No is_blitz check is here because masking takes care of the max amount of armies anyways.
+        max_a, max_d = max_atk_def_troops
+        starting_def = def_armies
 
-        atk_roll.sort()
-        def_roll.sort()
+        total_atk_losses = 0
+        total_def_losses = 0
+        last_atk_dice = 0
 
-        losses_att = 0
-        losses_def = 0
-        for a, d in zip(reversed(atk_roll), reversed(def_roll)):
-            if a > d:
-                # Attacker has a higher die roll.
-                losses_def += 1
-            else:
-                # Defender has a higher or equal die roll.
-                losses_att += 1
+        while atk_armies > 0 and def_armies > 0:
 
-        return losses_att, losses_def
+            atk_dice = min(max_a, atk_armies)
+            def_dice = min(max_d, def_armies)
+
+            last_atk_dice = atk_dice
+
+            k = min(atk_dice, def_dice)
+
+            atk = rng.integers(1, 7, size=atk_dice)
+            df  = rng.integers(1, 7, size=def_dice)
+
+            atk_top = np.partition(atk, -k)[-k:]
+            def_top = np.partition(df, -k)[-k:]
+
+            atk_top.sort()
+            def_top.sort()
+
+            losses_def = np.sum(atk_top > def_top)
+            losses_att = k - losses_def
+
+            atk_armies -= losses_att
+            def_armies -= losses_def
+
+            total_atk_losses += losses_att
+            total_def_losses += losses_def
+
+        if total_def_losses != starting_def:
+            # Defense still has troops, attack has lost. No troops to move.
+            return total_atk_losses, total_def_losses, 0
+
+        # Attack has won.
+        return total_atk_losses, total_def_losses, int(last_atk_dice)

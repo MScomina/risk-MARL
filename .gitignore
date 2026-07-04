@@ -154,3 +154,7 @@ Makefile
 .continue
 .playwright-mcp
 .vscode
+
+log/ppo/ppo_all
+# Uncomment the following if you don't want to post your models
+# log/

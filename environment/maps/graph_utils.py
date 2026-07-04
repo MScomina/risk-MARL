@@ -12,13 +12,13 @@ def generate_graph(map_path: str | Path | None = None) -> nx.Graph:
     with open(map_path, "r", encoding="utf-8") as fh:
         data = json.load(fh)
 
-    territories = data["territories"]
-    continents  = data["continents"]
+    territories : dict = data["territories"]
+    continents : dict  = data["continents"]
 
     terr_to_cont = {}
-    for cont in continents:
+    for cont_name, cont in continents.items():
         for t in cont["territories"]:
-            terr_to_cont[t] = cont["name"]
+            terr_to_cont[t] = cont_name
 
     G = nx.Graph()
 
@@ -38,10 +38,7 @@ def generate_graph(map_path: str | Path | None = None) -> nx.Graph:
         for nbr_name in attrs["adjacency"]:
             G.add_edge(territory_name, nbr_name)
 
-    G.graph["continents"] = {
-        cont["name"]: {"bonus": cont["bonus"], "territories": cont["territories"]}
-        for cont in continents
-    }
+    G.graph["continents"] = continents
 
     G = G.to_directed()
     G.graph["edge_to_idx"] = {}

@@ -2,9 +2,9 @@
 	"name": "Risk: Original (Classic)",
 	"description": "The classic Risk board with 42 territories.",
     "source": "https://en.wikipedia.org/wiki/Risk_(game)#/media/File:Risk_game_graph.svg",
-	"continents": [
-		{
-			"name": "north_america",
+	"continents": {
+		"north_america" : {
+			"name": "North America",
 			"bonus": 5,
 			"territories": [
 				"alaska",
@@ -18,8 +18,8 @@
 				"western_united_states"
 			]
 		},
-		{
-			"name": "south_america",
+		"south_america" : {
+			"name": "South America",
 			"bonus": 2,
 			"territories": [
 				"argentina",
@@ -28,8 +28,8 @@
 				"venezuela"
 			]
 		},
-		{
-			"name": "europe",
+		"europe" : {
+			"name": "Europe",
 			"bonus": 5,
 			"territories": [
 				"great_britain",
@@ -41,8 +41,8 @@
 				"western_europe"
 			]
 		},
-		{
-			"name": "africa",
+		"africa" : {
+			"name": "Africa",
 			"bonus": 3,
 			"territories": [
 				"congo",
@@ -53,8 +53,8 @@
 				"south_africa"
 			]
 		},
-		{
-			"name": "asia",
+		"asia" : {
+			"name": "Asia",
 			"bonus": 7,
 			"territories": [
 				"afghanistan",
@@ -71,8 +71,8 @@
 				"yakutsk"
 			]
 		},
-		{
-			"name": "australia",
+		"australia" : {
+			"name": "Australia",
 			"bonus": 2,
 			"territories": [
 				"eastern_australia",
@@ -81,7 +81,7 @@
 				"western_australia"
 			]
 		}
-	],
+	},
 	"territories": {
 		"alaska": {
 			"name": "Alaska",

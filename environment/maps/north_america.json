@@ -1,0 +1,61 @@
+{
+	"name": "Risk: North America",
+	"description": "Risk's North America continent.",
+    "source": "https://en.wikipedia.org/wiki/Risk_(game)#/media/File:Risk_game_graph.svg",
+	"continents": {
+		"north_america" : {
+			"name": "North America",
+			"bonus": 5,
+			"territories": [
+				"alaska",
+				"alberta",
+				"central_america",
+				"eastern_united_states",
+				"greenland",
+				"northwest_territory",
+				"ontario",
+				"quebec",
+				"western_united_states"
+			]
+		}
+	},
+	"territories": {
+		"alaska": {
+			"name": "Alaska",
+			"adjacency": ["northwest_territory", "alberta"]
+		},
+		"northwest_territory": {
+			"name": "Northwest Territory",
+			"adjacency": ["alaska", "alberta", "ontario", "greenland"]
+		},
+		"alberta": {
+			"name": "Alberta",
+			"adjacency": ["alaska", "northwest_territory", "ontario", "western_united_states"]
+		},
+		"ontario": {
+			"name": "Ontario",
+			"adjacency": ["northwest_territory", "alberta", "quebec", "western_united_states", "eastern_united_states", "greenland"]
+		},
+		"quebec": {
+			"name": "Quebec",
+			"adjacency": ["greenland", "ontario", "eastern_united_states"]
+		},
+		"eastern_united_states": {
+			"name": "Eastern United States",
+			"adjacency": ["ontario", "quebec", "western_united_states", "central_america"]
+		},
+		"western_united_states": {
+			"name": "Western United States",
+			"adjacency": ["alberta", "ontario", "eastern_united_states", "central_america"]
+		},
+		"central_america": {
+			"name": "Central America",
+			"adjacency": ["eastern_united_states", "western_united_states"]
+		},
+		"greenland": {
+			"name": "Greenland",
+			"adjacency": ["northwest_territory", "ontario", "quebec"]
+		}
+	}
+}
+  
