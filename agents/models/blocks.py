@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from torch_geometric.nn import TransformerConv
+from torch_geometric.nn import SAGEConv
 
 
 class RunningMeanStd(nn.Module):
@@ -95,6 +95,41 @@ class FiLMBlock(nn.Module):
         torch.nn.init.orthogonal_(self.beta.weight, gain=0.05)
         torch.nn.init.zeros_(self.beta.bias)
 
+
+class PolicyHead(nn.Module):
+    def __init__(self, feature_dim : int, res_depth : int = 3, activation_fn : nn.Module = nn.ReLU, starting_residual_scale : float = 1.0):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.activation_fn = activation_fn
+        self.res_depth = res_depth
+        self.starting_residual_scale = starting_residual_scale
+        self.res_blocks = nn.Sequential(
+            *[ResidualBlock(
+                channels=self.feature_dim,
+                activation_fn=self.activation_fn,
+                starting_residual_scale=self.starting_residual_scale
+            ) for _ in range(self.res_depth)]
+        )
+        self.output_layer = nn.Linear(self.feature_dim, 1)
+
+        self._init_weights()
+
+    def forward(self, x):
+        return self.output_layer(x)
+
+    def _init_weights(self):
+
+        for m in self.res_blocks.modules():
+            if isinstance(m, nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    torch.nn.init.constant_(m.bias, 0.0)
+
+        for m in self.output_layer.modules():
+            if isinstance(m, nn.Linear):
+                torch.nn.init.orthogonal_(m.weight, gain=0.01)
+                torch.nn.init.zeros_(m.bias)
+        
 class ResidualBlock(nn.Module):
 
     def __init__(self, channels, activation_fn : nn.Module = nn.ReLU, starting_residual_scale : float = 1.0, is_residual : bool = True):
@@ -124,42 +159,39 @@ class GraphResidualBlock(nn.Module):
         self,
         in_channels,
         hidden_size,
-        n_heads,
         activation_fn=nn.ReLU,
         edge_dim=5,
-        dropout=0.1,
         is_residual=True,
         starting_residual_scale=1.0
     ):
         super().__init__()
 
-        self.is_residual = is_residual and (in_channels == hidden_size)
+        self.is_residual = is_residual
 
-        self.conv = TransformerConv(
-            in_channels,
-            hidden_size,
-            heads=n_heads,
-            concat=True,
-            dropout=dropout,
-            edge_dim=edge_dim,
+        self.conv = SAGEConv(
+            in_channels=in_channels,
+            out_channels=hidden_size,
+            normalize=True
         )
 
-        self.proj = nn.Linear(
-            hidden_size * n_heads,
-            hidden_size
-        )
+        if self.is_residual and in_channels != hidden_size:
+            self.skip = nn.Linear(in_channels, hidden_size)
+        else:
+            self.skip = None
 
         self.norm = PureLayerNorm(hidden_size)
         self.activation = activation_fn()
         if self.is_residual:
             self.residual_scale = nn.Parameter(torch.tensor(starting_residual_scale))
 
-    def forward(self, x, edge_index, edge_attr):
+    def forward(self, x, edge_index):
 
-        residual = x
+        if self.is_residual:
+            residual = x
+            if self.skip is not None:
+                residual = self.skip(residual)
 
-        x = self.conv(x, edge_index, edge_attr)
-        x = self.proj(x)
+        x = self.conv(x, edge_index)
         x = self.norm(x)
         x = self.activation(x)
 

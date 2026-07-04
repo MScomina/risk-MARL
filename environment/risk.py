@@ -2,13 +2,15 @@
 # https://pettingzoo.farama.org/content/environment_creation/
 # https://arxiv.org/pdf/2402.07411 (Potential-Based Reward Shaping For Intrinsic Motivation)
 
-from copy import copy
+from copy import copy, deepcopy
 from functools import cached_property, lru_cache
+import random
 
 import numpy as np
 
 from gymnasium.utils import seeding, EzPickle
 from gymnasium.spaces import Dict
+from gymnasium.logger import warn
 from pettingzoo import AECEnv
 from pettingzoo.utils import AgentSelector, wrappers
 
@@ -37,6 +39,7 @@ from .config import (
     DENSE_REWARDS,
     MAX_ATK_DEF_TROOPS,
     IS_BLITZ,
+    SHUFFLE_AGENTS
 )
 from .maps import graph_utils
 from .risk_utils import RiskHelper
@@ -73,13 +76,14 @@ class raw_env(AECEnv, EzPickle):
     def __init__(self, render_mode=None, n_agents : int = NUM_AGENTS, map_path : Path | None = None,
                  max_armies : int = MAX_ARMIES, max_iters : int = MAX_ITERS, is_card_game : bool = IS_CARD_GAME,
                  dense_rewards : bool = DENSE_REWARDS, max_atk_def_troops : tuple[int, int] = MAX_ATK_DEF_TROOPS,
-                 is_blitz : bool = IS_BLITZ, rng: np.random.Generator | None = None, gamma : float = 0.999):
+                 is_blitz : bool = IS_BLITZ, shuffle_agents : bool = SHUFFLE_AGENTS, rng: np.random.Generator | None = None, 
+                 gamma : float = 0.999):
 
         EzPickle.__init__(self, render_mode, n_agents, map_path, max_armies, max_iters, is_card_game)
         super().__init__()
 
         self.agents = ["player_" + str(r) for r in range(n_agents)]
-        self.possible_agents = self.agents[:]
+        self.possible_agents = deepcopy(self.agents)
         self.n_agents = n_agents
         self.map_network = graph_utils.generate_graph(map_path)
         self.max_armies = max_armies
@@ -99,6 +103,7 @@ class raw_env(AECEnv, EzPickle):
         # False: Only singular attack instances are allowed
         # True: agents can send any amount they have, the battles will go until armies on either end finish.
         self.is_blitz = is_blitz
+        self.shuffle_agents = shuffle_agents
         self.max_atk_def_troops = max_atk_def_troops
         self.gamma = gamma
 
@@ -135,8 +140,12 @@ class raw_env(AECEnv, EzPickle):
         self.terminations = {agent: False for agent in self.agents}
         self.truncations = {agent: False for agent in self.agents}
         self.infos = {agent: {} for agent in self.agents}
-
-        self._agent_selector = AgentSelector(self.agents)
+        if self.shuffle_agents:
+            random_shuffle = list(self.agents)
+            random.shuffle(random_shuffle)
+            self._agent_selector = AgentSelector(random_shuffle)
+        else:
+            self._agent_selector = AgentSelector(self.agents)
         self.agent_selection = self._agent_selector.reset()
         self.current_agent_idx = 0
         self.strength_dirty = True
@@ -155,6 +164,19 @@ class raw_env(AECEnv, EzPickle):
         return self._action_spaces[agent]
 
 
+    def render(self):
+        if not self.render_mode:
+            warn("You are calling render method without specifying any render mode.")
+            return
+
+        from .renderer import RiskPygameRenderer
+
+        if not hasattr(self, "_renderer"):
+            self._renderer = RiskPygameRenderer(self)
+
+        self._renderer.draw()
+
+
     def reset(self, seed=None, options=None):
 
         self.timestep = 0
@@ -164,14 +186,20 @@ class raw_env(AECEnv, EzPickle):
             self.risk_helper.rng = self.rng
 
         self.agents = copy(self.possible_agents)
+        if self.shuffle_agents:
+            random.shuffle(self.agents)
         self.rewards = {agent: 0 for agent in self.agents}
         self._cumulative_rewards = {agent: 0 for agent in self.agents}
         self._clear_rewards()
         self.terminations = {agent: False for agent in self.agents}
         self.truncations = {agent: False for agent in self.agents}
         self.infos = {agent: {} for agent in self.agents}
-
-        self._agent_selector.reinit(self.agents)
+        if self.shuffle_agents:
+            random_shuffle = list(self.agents)
+            random.shuffle(random_shuffle)
+            self._agent_selector.reinit(random_shuffle)
+        else:
+            self._agent_selector.reinit(self.agents)
         self.agent_selection = self._agent_selector.reset()
         self.agent_to_idx = {
             agent: i
@@ -204,7 +232,9 @@ class raw_env(AECEnv, EzPickle):
 
 
     def close(self):
-        pass
+        if self._renderer is not None:
+            self._renderer.quit()
+            self._renderer = None
 
 
     def step(self, action):
@@ -257,6 +287,9 @@ class raw_env(AECEnv, EzPickle):
                 self.truncations[agent] = True
 
         self._accumulate_rewards()
+
+        if self.render_mode == "human":
+            self.render()
 
 
     def _update_state(self, agent : str, action : int) -> bool:

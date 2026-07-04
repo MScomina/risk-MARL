@@ -14,7 +14,8 @@ from .blocks import (
     RunningMeanStd,
     ResidualBlock,
     GraphResidualBlock,
-    PureLayerNorm
+    PureLayerNorm,
+    PolicyHead
 )
 
 class GraphNetwork(nn.Module):
@@ -30,8 +31,8 @@ class GraphNetwork(nn.Module):
                 embed_space_phase : int = 16,
                 graph_depth : int = 2,
                 residual_depth : int = 3,
-                starting_residual_scale : float = 1.0,
-                n_heads : int = 8
+                policy_head_depth : int = 3,
+                starting_residual_scale : float = 1.0
                 ):
         super().__init__()
         if "observation" in obs_space.keys():
@@ -45,8 +46,8 @@ class GraphNetwork(nn.Module):
         self.continent_dim = embed_space_continent
         self.graph_depth = graph_depth
         self.residual_depth = residual_depth
+        self.policy_head_depth = policy_head_depth
         self.starting_residual_scale = starting_residual_scale
-        self.n_heads = n_heads
 
         unique_continents = sorted(set([
             self.map_graph.nodes[node].get('continent', 'Unknown')
@@ -84,40 +85,35 @@ class GraphNetwork(nn.Module):
         gnn_layers = [
             (
                 GraphResidualBlock(
-                    f_in,
-                    self.gnn_hidden_s,
-                    self.n_heads,
+                    in_channels=f_in,
+                    hidden_size=self.gnn_hidden_s,
                     activation_fn=self.activation_function,
-                    dropout=0.1,
                     is_residual=True,
                 ),
-                'x, edge_index, edge_attr -> x'
+                'x, edge_index -> x'
             )
         ]
 
         gnn_layers.extend(
             (
                 GraphResidualBlock(
-                    self.gnn_hidden_s,
-                    self.gnn_hidden_s,
-                    self.n_heads,
+                    in_channels=self.gnn_hidden_s,
+                    hidden_size=self.gnn_hidden_s,
                     activation_fn=self.activation_function,
-                    dropout=0.1,
                     is_residual=True,
                 ),
-                'x, edge_index, edge_attr -> x'
+                'x, edge_index -> x'
             )
             for _ in range(self.graph_depth - 1)
         )
 
         self.gnn = PyGSequential(
-            'x, edge_index, edge_attr',
+            'x, edge_index',
             gnn_layers
         )
 
-        self.pool_layers_aggrs = ["mean", "min", "max", "std", "sum"]
+        self.pool_layers_aggrs = ["mean", "min", "max", "std"]
         self.pool_layers_aggrs_kwargs = [
-            {},
             {},
             {},
             {},
@@ -136,29 +132,34 @@ class GraphNetwork(nn.Module):
             ]
         )
 
-        self.node_score_head = nn.Sequential(
-            nn.Linear(
-                self.gnn_hidden_s + self.res_hidden_s,
-                self.gnn_hidden_s
-            ),
-            activation_function(),
-            nn.Linear(self.gnn_hidden_s, 1)
-        )
-        self.edge_attr_dim = 5
-        self.edge_score_head = nn.Sequential(
-            nn.Linear(
-                (self.gnn_hidden_s * 2)
-                + self.edge_attr_dim
-                + self.res_hidden_s,
-                self.gnn_hidden_s
-            ),
-            activation_function(),
-            nn.Linear(self.gnn_hidden_s, 1)
-        )
         parameter_out_shape = max(len(TradeChoices), len(TroopAction)) if not self.is_likely_critic else 1
+        self.edge_attr_dim = 5
+
+        if not self.is_likely_critic:
+            self.node_score_head = PolicyHead(
+                feature_dim=(self.gnn_hidden_s + self.res_hidden_s),
+                res_depth=self.policy_head_depth,
+                activation_fn=self.activation_function,
+                starting_residual_scale=self.starting_residual_scale
+            )
+            self.edge_score_head = PolicyHead(
+                feature_dim=(self.gnn_hidden_s * 2) + self.edge_attr_dim + self.res_hidden_s,
+                res_depth=self.policy_head_depth,
+                activation_fn=self.activation_function,
+                starting_residual_scale=self.starting_residual_scale
+            )
+            self.edge_noop_head = nn.Linear(self.res_hidden_s, 1)
+            self.other_policy_head = nn.Sequential(
+                *[ResidualBlock(
+                    channels=self.res_hidden_s,
+                    activation_fn=self.activation_function,
+                    starting_residual_scale=self.starting_residual_scale
+                ) for _ in range(self.policy_head_depth)]
+            )
+
         self.parameter_head = nn.Linear(self.res_hidden_s, parameter_out_shape)
 
-        projection_size = (len(self.pool_layers_aggrs)*self.gnn_hidden_s) + 1 # pooling layers and reinforcements
+        projection_size = (len(self.pool_layers_aggrs)*self.gnn_hidden_s) + 1 # Pooling layers and reinforcements
 
         self.film_block = FiLMBlock(self.embed_space_phase, self.res_hidden_s)
 
@@ -198,7 +199,6 @@ class GraphNetwork(nn.Module):
         else:
             obs_dict = obs
 
-        # Basic initialization
         territory_owner = torch.as_tensor(obs_dict["territory_owner"], dtype=torch.long, device=device)
         selected_node = torch.as_tensor(obs_dict["selected_node"], dtype=torch.long, device=device)
         selected_edge = torch.as_tensor(obs_dict["selected_edge"], dtype=torch.long, device=device)
@@ -212,18 +212,23 @@ class GraphNetwork(nn.Module):
         batch_size = territory_owner.shape[0]
         num_nodes = territory_owner.shape[1]
 
-        node_continents = []
-        for i in range(num_nodes):
-            node_name = self.map_graph.graph["idx_to_node"][i]
-            cont_name = self.map_graph.nodes[node_name]["continent"]
-            node_continents.append(self.continent_to_idx[cont_name])
+        # Continent embedding
+        node_names = np.array(
+            [self.map_graph.graph["idx_to_node"][i] for i in range(num_nodes)]
+        )
+        continents = np.array(
+            [self.map_graph.nodes[name]["continent"] for name in node_names]
+        )
+        unique_conts, cont_ordinals = np.unique(continents, return_inverse=True)
+        continent_indices = torch.from_numpy(cont_ordinals).to(device)
+        continent_embeddings = self.continent_embedder(continent_indices)
+        continent_embeddings = continent_embeddings.unsqueeze(0).expand(batch_size, -1, -1)
 
-        continent_indices = torch.tensor(node_continents, dtype=torch.long, device=device)
-        continent_embeddings = self.continent_embedder(continent_indices).unsqueeze(0).expand(batch_size, -1, -1)
-
+        # Phase embedding
         phase_emb = self.phase_embedder(action_phase)
         phase_node_context = phase_emb.unsqueeze(1).repeat(1, num_nodes, 1)
 
+        # Node ownership embedding
         owner_category = torch.where(
             territory_owner > 0,
             2,
@@ -237,28 +242,30 @@ class GraphNetwork(nn.Module):
 
         owner_shifted = territory_owner + 1
 
+        # Army embedding
         army_by_owner = torch.zeros(batch_size, self.n_players + 1, device=device, dtype=torch.float)
-        territories_by_owner = torch.zeros(batch_size, self.n_players + 1, device=device, dtype=torch.float)
-
         army_by_owner.scatter_add_(1, owner_shifted, armies_tensor)
+        owner_army_total = self.owner_army_norm(torch.log1p(army_by_owner.gather(1, owner_shifted)).unsqueeze(-1))
+
+        # Total ownership embedding
+        territories_by_owner = torch.zeros(batch_size, self.n_players + 1, device=device, dtype=torch.float)
         territories_by_owner.scatter_add_(
             1,
             owner_shifted,
             torch.ones_like(owner_shifted, dtype=torch.float)
         )
-
-        owner_army_total = self.owner_army_norm(torch.log1p(army_by_owner.gather(1, owner_shifted)).unsqueeze(-1))
         owner_territory_total = territories_by_owner.gather(1, owner_shifted)
-
         owner_territory_total = self.owner_territory_norm(
-            owner_territory_total.unsqueeze(-1)
+            torch.log1p(owner_territory_total).unsqueeze(-1)
         )
 
+        # Node ownership embedding
         node_select_onehot = torch.zeros(batch_size, num_nodes, device=device)
         valid_node_sel = selected_node >= 0
         node_select_onehot[valid_node_sel, selected_node[valid_node_sel]] = 1.0
         node_select_onehot = node_select_onehot.unsqueeze(2)
 
+        # Edge action directionality embedding
         edge_node_indicator = torch.zeros(batch_size, num_nodes, device=device)
         valid_edge_sel = selected_edge >= 0
 
@@ -314,7 +321,7 @@ class GraphNetwork(nn.Module):
 
         batched_edge_index = torch.stack([edge_src_b, edge_dst_b], dim=0)
 
-        h_nodes = self.gnn(x_flat, batched_edge_index, edge_attr)
+        h_nodes = self.gnn(x_flat, batched_edge_index)
 
         batch_idx = torch.arange(batch_size, device=device).repeat_interleave(num_nodes)
         h_pooled = self.pool_layers(h_nodes, index=batch_idx)
@@ -376,8 +383,8 @@ class GraphNetwork(nn.Module):
                     phase_scores = phase_scores.squeeze(-1)
                     phase_scores = phase_scores.view(batch_size, -1)
 
-                    full_logits[phase_mask, phase_scores.shape[1]] = -1e6   # Arbitrarily large but not infinite logit for the No-op operation
                     full_logits[phase_mask, :phase_scores.shape[1]] = phase_scores[phase_mask]
+                    # Nodes do not have a no-op head since there's literally no scenario where a no-op should be possible.
 
                 elif phase in [RiskPhase.SELECT_EDGE]:
                     h_src = h_nodes[edge_src_b]
@@ -403,11 +410,13 @@ class GraphNetwork(nn.Module):
                     )
                     phase_scores = self.edge_score_head(edge_features.view(batch_size, -1, self.gnn_hidden_s*2+self.edge_attr_dim+self.res_hidden_s))
                     phase_scores = phase_scores.view(batch_size, -1)
+                    no_op_score = self.edge_noop_head(h_res)
+                    no_op_score = no_op_score.view(batch_size)
 
-                    full_logits[phase_mask, phase_scores.shape[1]] = -1e6   # Arbitrarily large but not infinite logit for the No-op operation
                     full_logits[phase_mask, :phase_scores.shape[1]] = phase_scores[phase_mask]
+                    full_logits[phase_mask, phase_scores.shape[1]] = no_op_score[phase_mask]
                 else:
-                    phase_scores = self.parameter_head(h_res)
+                    phase_scores = self.parameter_head(self.other_policy_head(h_res))
                     full_logits[phase_mask, :phase_scores.shape[1]] = phase_scores[phase_mask]
         else:
             phase_scores = self.parameter_head(h_res)
@@ -419,6 +428,9 @@ class GraphNetwork(nn.Module):
             valid_mask = torch.as_tensor(obs["mask"], dtype=torch.bool, device=device)
             logits = logits.masked_fill(~valid_mask, float('-inf'))
             logits = logits - logits.max(dim=-1, keepdim=True).values
+
+        if torch.all(torch.isinf(logits)):
+            print("Huh.")
 
         if self.is_likely_critic:
             return logits.cpu()
@@ -433,11 +445,9 @@ class GraphNetwork(nn.Module):
                 if m.bias is not None:
                     torch.nn.init.constant_(m.bias, 0.0)
 
-        for module_list in [self.node_score_head.modules(), self.edge_score_head.modules()]:
-            for m in module_list:
-                if isinstance(m, nn.Linear):
-                    torch.nn.init.orthogonal_(m.weight, gain=0.05)
-                    torch.nn.init.zeros_(m.bias)
+        if not self.is_likely_critic:
+            for module_list in [self.node_score_head, self.edge_score_head]:
+                module_list._init_weights()
 
-        torch.nn.init.normal_(self.phase_embedder.weight, mean=0.0, std=0.05)
-        torch.nn.init.normal_(self.continent_embedder.weight, mean=0.0, std=0.05)
+        torch.nn.init.normal_(self.phase_embedder.weight, mean=0.0, std=0.5)
+        torch.nn.init.normal_(self.continent_embedder.weight, mean=0.0, std=0.5)
