@@ -7,7 +7,7 @@ import torch.nn as nn
 import numpy as np
 from gymnasium import spaces
 from environment.constants import TradeChoices, TroopAction, RiskPhase
-from torch_geometric.nn import TransformerConv, Sequential as PyGSequential
+from torch_geometric.nn import Sequential as PyGSequential
 from torch_geometric.nn.aggr import MultiAggregation
 from .blocks import (
     FiLMBlock,
@@ -19,6 +19,25 @@ from .blocks import (
 )
 
 class GraphNetwork(nn.Module):
+    '''
+        This is the blueprint of the base agent that is used in this project.
+        It is defined as a Graph Neural Network that takes in the current world state and computes, depending on the phase:
+        - Logits for each node or edge, depending on how good the move is based on the features passed.
+        - Logits for the correct amount of troops to send/reinforce/attack with.
+        - Logits for the card trade, if applicable.
+
+        It makes use of the following techniques/modules:
+        - Residual GraphSAGE GNN.
+        - Running mean/std, for normalizing the observations to ~(0, 1).
+        - LayerNorm for normalizing inside the layers.
+        - Embedding layers for categorical values (e.g. phase, continents).
+        - FiLM conditioning based on the phase embedding (check the class FiLMBlock for details).
+        - Residual connections (to improve gradient flow and stability).
+        - Aggregation layers ("mean", "min", "max", "std") on the map's embeddings.
+
+        The network works both as critic and as actor, depending on the output shape, allowing for maximum flexibility
+        for various Reinforcement Learning techniques (actor-only, critic-only or actor-critic).
+    '''
 
     def __init__(self, 
                 obs_space : spaces.Dict, 
@@ -66,7 +85,7 @@ class GraphNetwork(nn.Module):
         self.is_likely_critic = (self.output_shape == 1)
         self.n_players = int(obs_space["territory_owner"].high[0])
 
-        f_in = (
+        n_features_in = (
             self.num_owner_categories +
             1 + # Normalized armies
             1 + # Owner army total
@@ -85,7 +104,7 @@ class GraphNetwork(nn.Module):
         gnn_layers = [
             (
                 GraphResidualBlock(
-                    in_channels=f_in,
+                    in_channels=n_features_in,
                     hidden_size=self.gnn_hidden_s,
                     activation_fn=self.activation_function,
                     is_residual=True,
@@ -364,7 +383,6 @@ class GraphNetwork(nn.Module):
         if not self.is_likely_critic:
             for phase in unique_phases:
                 phase_mask = (action_phase == phase)
-                num_in_phase = phase_mask.sum().item()
                 if phase in [RiskPhase.SELECT_NODE, RiskPhase.STARTING_PLACEMENT]:
                     h_nodes_b = h_nodes.view(batch_size, num_nodes, -1)
 

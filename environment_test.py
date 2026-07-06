@@ -3,6 +3,11 @@ from pettingzoo.test import api_test, performance_benchmark
 import time
 import numpy as np
 
+'''
+    This script is designed to check whether the environment's logic and rendering
+    works with PettingZoo's APIs, and also to give a visualization of any map.
+'''
+
 N_PLAYERS = 4
 RENDER_COOLDOWN = 0.05
 

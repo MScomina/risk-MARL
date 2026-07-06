@@ -1,6 +1,5 @@
 # https://github.com/thu-ml/tianshou/blob/master/examples/vizdoom/vizdoom_ppo.py
 # https://arxiv.org/pdf/2006.05990 (What Matters In On-Policy Reinforcement Learning? A Large-Scale Empirical Study)
-# https://link.springer.com/content/pdf/10.1007/s10994-025-06822-0.pdf (Analyzing the effect of residual connections to oversmoothing in graph neural networks)
 
 import numpy as np
 import copy
@@ -338,12 +337,7 @@ def train_phase(phase_index, phase_cfg, writer):
 # --------------------------------------------------------------------------- #
 def watch(last_phase_cfg, phase_index):
     """
-    Render a single episode with the last trained policy.
-
-    * `last_phase_cfg` – configuration of the final training phase.
-    * `phase_index`   – index that will be passed to `build_agents`; it must be
-      one larger than the numeric part used when saving checkpoints (so
-      `phase_index = len(phases)`).
+        Render five episodes with the last trained policy.
     """
     env_params = {
         "max_iters": last_phase_cfg.max_iters,
