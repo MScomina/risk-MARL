@@ -1,21 +1,22 @@
 import numpy as np
 from .constants import CardType, TradeChoices
 
+# Default values of the classic Risk map.
 CLASSIC_MAP_SIZE = 42
 DEFAULT_DENSITY = 2.8
 
-# Defines how the DENSE reward's weights are computed.
+# Defines how the DENSE reward's weights are computed. Check risk._update_strength for the exact formula.
 TERRITORY_REWARD_COEFF = 1.0
 TROOPS_REWARD_COEFF = 1.0
 CONTINENT_REWARD_COEFF = 5.0
 
 CONTINENT_REWARD_SPIKY = 4.0
 
-# Scales the DENSE reward.
+# Scales the DENSE reward. Check risk._update_strength for the exact formula.
 RAW_REWARD_SCALING = 0.5
 FINAL_PARTIAL_REWARD_SCALING = 0.2
 
-# Default args.
+# Default args for the environment.
 NUM_AGENTS = 2
 MAX_ARMIES = 1_000
 MAX_ITERS = 10_000

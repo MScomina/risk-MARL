@@ -10,14 +10,12 @@ import torch
 import tianshou as ts
 from dataclasses import dataclass
 from torch.utils.tensorboard import SummaryWriter
-from tianshou.utils.net.discrete import DiscreteActor
 from tianshou.algorithm.modelfree.reinforce import DiscreteActorPolicy
 from tianshou.algorithm.optim import AdamOptimizerFactory
 from tianshou.algorithm.random import MARLRandomDiscreteMaskedOffPolicyAlgorithm
-from tianshou.algorithm import PPO
 from tianshou.env import PettingZooEnv
 from tianshou.algorithm.multiagent.marl import MultiAgentOnPolicyAlgorithm
-from tianshou.data import Collector, VectorReplayBuffer
+from tianshou.data import Collector
 from tianshou.utils import TensorboardLogger
 from tianshou.trainer import OnPolicyTrainerParams
 
@@ -377,7 +375,7 @@ def watch(last_phase_cfg, phase_index):
     collector = Collector(marl_algorithm, env)
     # Render episodes
     with torch.no_grad():
-        result = collector.collect(
+        _ = collector.collect(
             n_episode=5,
             reset_before_collect=True,
             render=0.1

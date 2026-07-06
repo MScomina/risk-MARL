@@ -1,6 +1,4 @@
 import sys
-import math
-import time
 from typing import Iterable, Tuple
 
 import pygame
