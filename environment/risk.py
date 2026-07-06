@@ -1,14 +1,13 @@
 # https://gymnasium.farama.org/api/env/
 # https://pettingzoo.farama.org/content/environment_creation/
-# https://arxiv.org/pdf/2402.07411 (Potential-Based Reward Shaping For Intrinsic Motivation)
 
 from copy import copy, deepcopy
-from functools import cached_property, lru_cache
+from functools import lru_cache
 import random
 
 import numpy as np
 
-from gymnasium.utils import seeding, EzPickle
+from gymnasium.utils import EzPickle
 from gymnasium.spaces import Dict
 from gymnasium.logger import warn
 from pettingzoo import AECEnv
@@ -187,24 +186,25 @@ class raw_env(AECEnv, EzPickle):
 
         self.agents = copy(self.possible_agents)
         if self.shuffle_agents:
-            random.shuffle(self.agents)
-        self.rewards = {agent: 0 for agent in self.agents}
-        self._cumulative_rewards = {agent: 0 for agent in self.agents}
-        self._clear_rewards()
-        self.terminations = {agent: False for agent in self.agents}
-        self.truncations = {agent: False for agent in self.agents}
-        self.infos = {agent: {} for agent in self.agents}
-        if self.shuffle_agents:
             random_shuffle = list(self.agents)
             random.shuffle(random_shuffle)
             self._agent_selector.reinit(random_shuffle)
         else:
             self._agent_selector.reinit(self.agents)
+
         self.agent_selection = self._agent_selector.reset()
         self.agent_to_idx = {
             agent: i
             for i, agent in enumerate(self.agents)
         }
+
+        self.rewards = {agent: 0 for agent in self.agents}
+        self._cumulative_rewards = {agent: 0 for agent in self.agents}
+        self._clear_rewards()
+
+        self.terminations = {agent: False for agent in self.agents}
+        self.truncations = {agent: False for agent in self.agents}
+        self.infos = {agent: {} for agent in self.agents}
 
         self.world_state = self.risk_helper.starting_observation(full_knowledge=True)
     
@@ -214,13 +214,12 @@ class raw_env(AECEnv, EzPickle):
 
         self.num_moves = 0
 
-        self.has_conquered_this_turn = False
+        self.turn_player_has_conquered = False
         self.is_first_turn = True
         self.has_received_starting_reinforcement[:] = False
 
         self.current_agent_idx = self.agent_to_idx[self.agent_selection]
         self.prev_phi = np.zeros(self.n_agents)
-        self.reward_ema = np.zeros(self.n_agents, dtype=np.float32)
         self.territory_counts = np.zeros(self.n_agents, dtype=np.int16)
         self.troop_counts = np.zeros(self.n_agents, dtype=np.int32)
         self.strength_dirty = True
@@ -271,7 +270,7 @@ class raw_env(AECEnv, EzPickle):
             self.current_agent_idx = self.agent_to_idx[self.agent_selection]
             if not self.world_state["action_phase"] == RiskPhase.STARTING_PLACEMENT:
                 self.world_state["troops_to_place"] = self._compute_reinforcements()
-            self.has_conquered_this_turn = False
+            self.turn_player_has_conquered = False
 
         self.num_moves += 1
         if self.num_moves >= self.max_iters:
@@ -293,8 +292,10 @@ class raw_env(AECEnv, EzPickle):
 
 
     def _update_state(self, agent : str, action : int) -> bool:
+        '''
+            Updates the world_state and returns whether the turn is over or not.
+        '''
 
-        # Updates the state and returns whether the turn is over or not.
         match self.world_state["action_phase"]:
 
             case RiskPhase.STARTING_PLACEMENT:
@@ -451,9 +452,9 @@ class raw_env(AECEnv, EzPickle):
 
         if self.world_state["number_of_armies"][dst_node] == 0:
             # No troops left, control switches.
-            if not self.has_conquered_this_turn and self.is_card_game:
+            if not self.turn_player_has_conquered and self.is_card_game:
                 self.world_state["cards_in_hand"][self.current_agent_idx][self.risk_helper.draw_card(rng=self.rng)] += 1
-                self.has_conquered_this_turn = True
+                self.turn_player_has_conquered = True
             self.territory_counts[self.current_agent_idx] += 1
             self.territory_counts[previous_owner] -= 1
             self.world_state["territory_owner"][dst_node] = self.current_agent_idx
@@ -494,6 +495,10 @@ class raw_env(AECEnv, EzPickle):
 
 
     def _compute_reinforcements(self) -> int:
+        '''
+            Computes and returns the number of reinforcements based on the current world state for the turn player.
+            This function also computes the starting reinforcements when there's no unowned territory.
+        '''
 
         # Troop reinforcements have been scaled with map size for the sake of balancing.
         if not self.has_received_starting_reinforcement[self.current_agent_idx]:
@@ -530,6 +535,9 @@ class raw_env(AECEnv, EzPickle):
         return total_amount
 
     def _update_cards(self, action : int | TradeChoices):
+        '''
+            Updates the cards' numbers after a card trade has gone through.
+        '''
         match action:
             case TradeChoices.NO_OP:
                 return
@@ -559,6 +567,13 @@ class raw_env(AECEnv, EzPickle):
 
 
     def _update_strength(self):
+        '''
+            This is the main function that deals with the dense reward.
+            Since the base reward would be way too sparse for agents to learn on, this function helps them by defining a dense potential-based reward shaping,
+            based on the current map strength (defined as a*territory_percentage + b*log(total_armies+1)/log(max_armies) + c*continents_percentage).
+            Coefficients are defined in config.py.
+            "Potential-Based Reward Shaping For Intrinsic Motivation": https://arxiv.org/pdf/2402.07411
+        '''
 
         territory_coeff = TERRITORY_REWARD_COEFF
         troops_coeff = TROOPS_REWARD_COEFF

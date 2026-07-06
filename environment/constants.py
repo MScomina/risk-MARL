@@ -2,6 +2,10 @@ from enum import Enum, IntEnum
 from dataclasses import dataclass
 
 class CardType(IntEnum):
+    '''
+        This class just marks the available card types.
+        One can potentially change this class to add custom card types for custom card trades.
+    '''
     INFANTRY = 0
     CAVALRY = 1
     ARTILLERY = 2
@@ -9,6 +13,15 @@ class CardType(IntEnum):
 
 
 class RiskPhase(IntEnum):
+    '''
+        This class is meant to facilitate the conversion between phases and actual applicable numbers inside the observation state.
+        Phase description:
+            - STARTING_PLACEMENT: Used at the beginning of the game to mark the "picking unowned nodes" phase of the game.
+            - SELECT_NODE: Used when reinforcing an already owned territory. Always followed by TROOPS_REINFORCE.
+            - SELECT_EDGE: Used when picking an edge for attacking/moving. Followed by either TROOPS_ATTACK or TROOPS_MOVEMENT, depending on the target node.
+            - TROOPS_REINFORCE/ATTACK/MOVEMENT: Used when the turn player has to pick the number of troops for the specific move.
+            - TRADE_CARDS: Used when the turn player has the chance to trade for cards at the start of their turn.
+    '''
     STARTING_PLACEMENT = 0
     SELECT_NODE = 1
     SELECT_EDGE = 2
@@ -19,6 +32,10 @@ class RiskPhase(IntEnum):
 
 
 class TradeChoices(IntEnum):
+    '''
+        This class is meant to allow flexible changes on the possible trade combinations.
+        Each element marks the trade that needs to be taken, which is then elaborated in risk._update_state.
+    '''
     NO_OP = 0
     TRADE_ARTILLERY = 1
     TRADE_INFANTRY = 2
@@ -28,6 +45,11 @@ class TradeChoices(IntEnum):
 
 
 class TroopAction(Enum):
+    '''
+        This class lists the available actions when it comes to deciding the number of troops to move.
+        Values can either be absolute numbers (marked with "abs") or a percentage of the source node's troops to send.
+        Note that not all actions may be choosable depending on the masking, but as long as ONE is a choice it's guaranteed to have one viable action.
+    '''
 
     ONE = ("abs", 1)
     TWO = ("abs", 2)

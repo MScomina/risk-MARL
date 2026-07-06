@@ -5,38 +5,41 @@ import networkx as nx
 import numpy as np
 
 from dataclasses import dataclass, field
-from .maps import graph_utils
 from .constants import (
     CardType,
     RiskPhase,
     TradeChoices,
     TroopAction
 )
-from .config import CARD_TYPES, CARD_PROBS, TRADE_AMOUNTS
 
-import functools
+from .config import CARD_TYPES, CARD_PROBS, TRADE_AMOUNTS, MAX_ATK_DEF_TROOPS
+
 from gymnasium.spaces import Box, Dict, Discrete, Space
 
 
 # State/observation spaces info:
 #   territory_owner: The owner of the territory, -1 if owned by nobody.
-#   number_of_armies: Number of armies in a territory.
-#   action_phase: Number representing the phase (0: initial placing, 1: select army count, 2: select node, 3: select edge, 4: trade cards)
+#   number_of_armies: Number of armies in a territory, always 0 if unowned.
+#   action_phase: Number representing the phase. For more details on each phase check the constants.RiskPhase class.
 #   troops_to_place: How many reinforcement troops are left to place (if reinforcement phase).
 #   selected_node: Node ID selected in a previous select_node move, -1 if not selected.
 #   selected_edge: Edge ID selected in a previous select_edge move, -1 if not selected.
 
 # Action space info:
 #   The action is a single number representing, based on the current action_phase, either:
-#   - Node ID to pick (if phase 0 or 1, usually meant for reinforcements) + 1 (No-op case)
-#   - Edge ID to pick (if phase 2, usually meant for movement/attack) + 1 (No-op case)
-#   - Number of armies to use (if phase 3, 4 or 5, usually after a node/edge pick move)
-#   - Card trade combination (if phase 6, usually at the start of the turn)
+#   - Node ID to pick (if starting placement or reinforcing) + 1 (No-op case)
+#   - Edge ID to pick (if selecting edge, usually for attacking or moving) + 1 (No-op case)
+#   - Number of armies to use (if attacking, moving or reinforcing, always after picking node/edge)
+#   - Card trade combination (if trading cards, usually at the start of the turn)
 
 
 @dataclass(slots=True)
 class RiskHelper():
-
+    '''
+        The RiskHelper class is a dataclass used to compute helper functions used in the Risk environment,
+        such as computing the initial state, masks for a given state and various game utilities such as 
+        battle outcomes and drawing cards.
+    '''
 
     game_map : nx.DiGraph
     num_agents : int
@@ -113,6 +116,9 @@ class RiskHelper():
 
 
     def starting_observation(self, full_knowledge : bool = False) -> dict:
+        '''
+            Generates the starting observations at the start of the game (no owned territories, no troops, no cards, starting placement phase).
+        '''
 
         observation : dict[str, np.ndarray] = {
             "territory_owner" : np.full(shape=self.num_nodes, fill_value=-1, dtype=np.int8),
@@ -134,6 +140,10 @@ class RiskHelper():
 
 
     def generate_action_mask(self, agent_id : int, agent_state : dict) -> np.ndarray:
+        '''
+            Given a certain state, computes the action mask of a certain agent_id (the allowed moves on the action space).
+            The action mask is a binary array of shape [action_shape, ].
+        '''
 
         match agent_state["action_phase"]:
 
@@ -320,29 +330,41 @@ class RiskHelper():
 
     @staticmethod
     def cards_trade_amount(trade_type : int | TradeChoices) -> int:
+        '''
+            Returns the number of troops received based on the specific trade type.
+        '''
         return TRADE_AMOUNTS[trade_type]
 
 
     @staticmethod
-    def draw_card(rng : np.random.Generator | None = None) -> int:
+    def draw_card(rng : np.random.Generator | None = None) -> CardType:
+        '''
+            Draws a card (returns the CardType, which is an IntEnum, corresponding to the card defined in CARD_TYPES).
+        '''
         rng = rng or np.random.default_rng()
         # If one wants to develop an actual drawing setup with a deck, this function is to change.
         # For simplicity, it has just been reduced to drawing from a RNG generator.
-        return rng.choice(
-            CARD_TYPES,
-            p=CARD_PROBS
+        return CardType(
+            rng.choice(
+                CARD_TYPES,
+                p=CARD_PROBS
+            )
         )
 
 
     @staticmethod
-    def risk_attack_outcome(atk_armies : int, def_armies : int, rng: np.random.Generator | None = None, max_atk_def_troops : tuple[int, int] = (3, 2)) -> tuple[int, int, int]:
-        
+    def risk_attack_outcome(atk_armies : int, def_armies : int, rng: np.random.Generator | None = None, max_atk_def_troops : tuple[int, int] = MAX_ATK_DEF_TROOPS) -> tuple[int, int, int]:
+        '''
+            Given the number of attack and defense armies (and additional rules such as the number of dices thrown on each side), returns
+            the number of remaining armies and the amount of moved armies if the attack side has won.
+            NOTE: There is no check for blitz rules in this class since it's always assumed that blitz rules have been checked beforehand,
+            through either masking or environment logic.
+        '''
         if rng is None:
             rng = np.random.default_rng()
 
         # Given a number of atk armies and def_armies, reiterate battle until either side is at 0.
         # Battles can be reiterated and have any amount of dices at a time.
-        # No is_blitz check is here because masking takes care of the max amount of armies anyways.
         max_a, max_d = max_atk_def_troops
         starting_def = def_armies
 
