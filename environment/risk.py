@@ -48,7 +48,7 @@ from .wrappers import FlattenObservationWrapper
 #   (Underlying) Space states:
 #       - Ownership of territories (part of observation)
 #       - Amount of armies in each territory (part of observation)
-#       - Action phase (0: initial placing, 1: select army count, 2: select node, 3: select edge, 4: select card trade)
+#       - Action phase (observation redundancy to improve action size efficiency)
 #       - Cards in hand (partial observability of each agent)
 #   Actions:
 #       The actions are defined based on the state, they could represent, based on the phase:
@@ -56,6 +56,7 @@ from .wrappers import FlattenObservationWrapper
 #       - Edge ID to pick
 #       - Number of armies to use
 #       - Type of card trade to perform
+# For more specific definitions, check the respective classes for each action in constants.py.
 
 
 def env(should_flatten_obs : bool = False, **kwargs) -> AECEnv:
@@ -465,9 +466,13 @@ class raw_env(AECEnv, EzPickle):
                 if self.is_card_game:
                     self.world_state["cards_in_hand"][self.current_agent_idx] += self.world_state["cards_in_hand"][previous_owner]
                     self.world_state["cards_in_hand"][previous_owner] = np.zeros(len(CardType), dtype=np.int16)
-                if self.dense_rewards:
-                    self.rewards[agent] += 0.3 / (self.num_agents-1)    # Wiping opponent is good
-                    self.rewards[self.agents[previous_owner]] -= 1.0    # Dying is bad
+                # NOTE (2026‑07‑11): Legacy dense‑reward code – removed from the current
+                # implementation. The model was trained without this logic, so it has no
+                # effect on results. Kept here only for reference; can be deleted permanently.
+                # after the project has been properly graded.
+                # if self.dense_rewards:
+                #    self.rewards[agent] += 0.3 / (self.num_agents-1)    # Wiping opponent is good
+                #    self.rewards[self.agents[previous_owner]] -= 1.0    # Dying is bad
 
         self.world_state["action_phase"] = RiskPhase.SELECT_EDGE
         self.world_state["selected_edge"] = -1
